@@ -30,4 +30,12 @@ foreach ($kind in @('root','file','directory')) {
   Case $sid.Value $ordinary 'Read' $kind $false
   Case $sid.Value $sid.Value 'FullControl' $kind $true
 }
+foreach ($kind in @('evidence','evidenceDirectory')) {
+  Case 'S-1-5-32-544' $sid.Value 'FullControl' $kind $true
+  Case $sid.Value $ordinary 'Read' $kind $false
+  Case $ti $sid.Value 'FullControl' $kind $false
+  Case 'S-1-5-18' $sid.Value 'FullControl' $kind $false
+  Case 'S-1-5-32-544' $ti 'Read' $kind $false
+  Case $sid.Value $sid.Value 'FullControl' $kind $true
+}
 [Console]::Out.WriteLine("descriptor-policy passed=$script:count (not filesystem-owner proof)")

@@ -26,11 +26,40 @@ try {
     CheckDescriptor $acl $kind $sid
   }
   if ($q.op -ne 'identity') {
-    if ($q.op -notin @('root','verifyRoot','inspectRoot','file','directory','launch')) { throw 'op' }
+    if ($q.op -notin @('root','verifyRoot','inspectRoot','file','directory','launch','createFile','createLock','evidence','evidenceDirectory')) { throw 'op' }
     $p = [string]$q.path
     CheckPath $p
     $parent = [IO.Directory]::GetParent($p)
-    while ($null -ne $parent) { CheckAcl $parent.FullName 'ancestor'; $parent = $parent.Parent }
+    $immediate = $true
+    while ($null -ne $parent) {
+      # Only the immediate Pi-owned evidence container gets the read-only role;
+      # higher layout ancestors retain the ordinary safe-ancestor policy.
+      $role = 'ancestor'
+      if ($immediate -and $q.op -eq 'evidence') { $role = 'evidenceDirectory' }
+      CheckAcl $parent.FullName $role
+      $immediate = $false; $parent = $parent.Parent
+    }
+    if ($q.op -in @('createFile','createLock')) {
+      $parentPath = [IO.Path]::GetDirectoryName($p)
+      CheckAcl $parentPath 'directory'
+      . (Join-Path $PSScriptRoot 'windows-create.ps1')
+      if ($q.op -eq 'createLock') {
+        $errorCode = CreatePrivateLock $p $sid
+        if ($errorCode -eq 183) {
+          [Console]::Out.Write((@{ok=$true;sid=$sid.Value;created=$false} | ConvertTo-Json -Compress))
+          exit 0
+        }
+        if ($errorCode -ne 0) { throw 'create directory' }
+        CheckAcl $p 'root'
+      } else {
+        $rights = [Security.AccessControl.FileSystemRights]::Read -bor [Security.AccessControl.FileSystemRights]::Write
+        $stream = [IO.FileStream]::new($p,[IO.FileMode]::CreateNew,$rights,[IO.FileShare]::None,4096,[IO.FileOptions]::None,(NewPrivateDescriptor $false $sid))
+        try { if ($stream.Length -ne 0) { throw 'not empty' } } finally { $stream.Dispose() }
+        CheckAcl $p 'file'
+      }
+      [Console]::Out.Write((@{ok=$true;sid=$sid.Value;created=$true} | ConvertTo-Json -Compress))
+      exit 0
+    }
     if ($q.op -eq 'inspectRoot' -and !(Test-Path -LiteralPath $p)) {
       [Console]::Out.Write((@{ok=$true;sid=$sid.Value} | ConvertTo-Json -Compress))
       exit 0
@@ -50,8 +79,8 @@ try {
     if ($kind -in @('root','verifyRoot','inspectRoot')) { $kind = 'root' }
     CheckAcl $p $kind
     $item = Get-Item -LiteralPath $p -Force
-    if ($kind -in @('root','directory') -and !$item.PSIsContainer) { throw 'type' }
-    if ($kind -in @('file','launch') -and $item.PSIsContainer) { throw 'type' }
+    if ($kind -in @('root','directory','evidenceDirectory') -and !$item.PSIsContainer) { throw 'type' }
+    if ($kind -in @('file','launch','evidence') -and $item.PSIsContainer) { throw 'type' }
   }
   [Console]::Out.Write((@{ok=$true;sid=$sid.Value} | ConvertTo-Json -Compress))
 } catch {

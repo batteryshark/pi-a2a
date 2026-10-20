@@ -23,8 +23,8 @@ export class Runtime {
   start() {
     if (process.platform === 'win32' && this.transcript()) {
       const file = this.transcript();
-      securePath(path.dirname(file), true);
-      if (fs.existsSync(file)) securePath(file);
+      securePath(path.dirname(file), true, {transcript:true});
+      if (fs.existsSync(file)) securePath(file, false, {transcript:true});
     }
     this.store.tx(s => {
       const old = s.sessions[this.self];
@@ -108,7 +108,7 @@ export class Runtime {
     // file on reconciliation, not the facade return or in-memory session tree.
     const file = this.transcript();
     if (!file || !fs.existsSync(file) || fs.statSync(file).size > 16 * 1024 * 1024) return new Set();
-    if (process.platform === 'win32') { try { securePath(file); } catch { return new Set(); } }
+    if (process.platform === 'win32') { try { securePath(file, false, {transcript:true}); } catch { return new Set(); } }
     const ids = new Set();
     for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
       try { const e = JSON.parse(line); if (e.type === 'custom_message' && e.customType === 'pi-a2a-reply') ids.add(e.details?.replyId); } catch { /* partial final append is not an ack */ }

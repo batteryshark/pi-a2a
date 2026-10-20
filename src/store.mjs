@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { accountIdentity, securePath, windowsHelper, windowsPath } from './platform.mjs';
 import { compact, NATIVE_BYTES, STATE_BYTES } from './ledger.mjs';
+import { acquirePrivateLock, openPrivateNew, samePrivateFile } from './private-create.mjs';
 
 export const id = () => crypto.randomUUID();
 export const live = pid => { if (!Number.isSafeInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
@@ -18,10 +19,11 @@ export function retryIO(fn, { platform = process.platform, wait = ms => Atomics.
   }
 }
 export class Store {
-  constructor(root, { readOnly = false } = {}) {
+  constructor(root, { readOnly = false, createFile = openPrivateNew, createLock = acquirePrivateLock } = {}) {
     accountIdentity();
     if (!path.isAbsolute(root)) throw Error('Absolute state root required');
     this.readOnly = readOnly;
+    this.createFile = createFile; this.createLock = createLock;
     if (process.platform === 'win32') {
       windowsPath(root);
       windowsHelper(readOnly ? 'inspectRoot' : 'root', root);
@@ -56,9 +58,9 @@ export class Store {
     if (this.readOnly) throw Error('Read-only inspection');
     if (process.platform === 'win32') windowsHelper('verifyRoot', this.root); else securePath(this.root, true);
     // No waiting/polling. A contended short transaction fails for caller retry.
-    try { fs.mkdirSync(this.lock, { mode: 0o700 }); }
+    try { this.createLock(this.lock); }
     catch (e) {
-      if (e.code !== 'EEXIST') throw e;
+      if (e.creationUncertain || e.code !== 'EEXIST') throw e;
       securePath(this.lock, true);
       let owner;
       try { securePath(path.join(this.lock, 'owner')); if (fs.statSync(path.join(this.lock, 'owner')).size > 1024) throw Error('owner limit'); owner = JSON.parse(fs.readFileSync(path.join(this.lock, 'owner'), 'utf8')); } catch { throw Error('State lock incomplete; manual reconciliation required'); }
@@ -71,22 +73,26 @@ export class Store {
     let committed = false, failure, result;
     try {
       securePath(this.lock, true);
-      const ownerFd = fs.openSync(owner, 'wx', 0o600);
+      const ownerFd = this.createFile(owner);
       try { securePath(owner); fs.writeFileSync(ownerFd, JSON.stringify({ pid: process.pid })); } finally { fs.closeSync(ownerFd); }
       const s = this.read(); compact(s); result = fn(s); compact(s);
       // Keep native growth from consuming the external transition reserve.
       if (Buffer.byteLength(JSON.stringify({ sessions:s.sessions, requests:s.requests, creates:s.creates })) > NATIVE_BYTES) throw Error('Native state capacity reached');
       const body = JSON.stringify(s);
       if (Buffer.byteLength(body) > STATE_BYTES) throw Error('State size limit reached; retained identities must not be evicted');
-      const fd = fs.openSync(tmp, 'wx', 0o600);
-      try { securePath(tmp); fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      const fd = this.createFile(tmp);
+      let written;
+      try { securePath(tmp); fs.writeFileSync(fd, body); fs.fsyncSync(fd); written=fs.fstatSync(fd); } finally { fs.closeSync(fd); }
       if (fs.existsSync(this.file)) securePath(this.file);
       retryIO(() => fs.renameSync(tmp, this.file)); committed = true;
+      securePath(this.file);
+      if (!samePrivateFile(written,fs.lstatSync(this.file))) throw Error('Replaced state identity changed');
       // Windows has no supported Node directory-fsync contract. File is flushed
       // before replacement; power-loss durability of directory metadata is unknown.
       if (process.platform !== 'win32') { const d = fs.openSync(this.root, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } }
     } catch (e) { failure = e; }
     try {
+      if (failure?.creationUncertain) throw failure;
       if (fs.existsSync(tmp)) retryIO(() => fs.unlinkSync(tmp));
       if (fs.existsSync(owner)) retryIO(() => fs.unlinkSync(owner));
       retryIO(() => fs.rmdirSync(this.lock));

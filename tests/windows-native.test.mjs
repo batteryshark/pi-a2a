@@ -7,13 +7,46 @@ import { spawnSync } from 'node:child_process';
 import { windowsHelper, accountIdentity, securePath } from '../src/platform.mjs';
 import { Store } from '../src/store.mjs';
 import { fixtureRoot } from './fixture.mjs';
+import { openPrivateNew } from '../src/private-create.mjs';
 
 const native = process.platform === 'win32';
 test('native descriptor policy: TrustedInstaller OS roles, strict payload roles and untrusted negatives', {skip:!native}, () => {
   const r=spawnSync(path.join(process.env.SystemRoot,'System32/WindowsPowerShell/v1.0/powershell.exe'),
     ['-NoLogo','-NoProfile','-NonInteractive','-File',fileURLToPath(new URL('./windows-policy.test.ps1',import.meta.url))],
     {encoding:'utf8',timeout:20000,shell:false});
-  assert.equal(r.status,0,r.stdout+r.stderr); assert.match(r.stdout,/passed=24/);
+  assert.equal(r.status,0,r.stdout+r.stderr); assert.match(r.stdout,/passed=36/);
+});
+test('native exclusive incomplete/live locks are never adopted or stolen', {skip:!native,timeout:90000},()=>{
+  const root=fixtureRoot('native-lock-');
+  try {
+    const store=new Store(root);
+    assert.equal(windowsHelper('createLock',store.lock).created,true);
+    assert.throws(()=>store.tx(()=>assert.fail('incomplete lock adopted')),/lock incomplete/);
+    const p=path.join(store.lock,'owner');
+    const fd=openPrivateNew(p);
+    try {
+      assert.throws(()=>store.tx(()=>assert.fail('empty owner adopted')),/lock incomplete/);
+      fs.writeFileSync(fd,JSON.stringify({pid:process.pid}));
+    } finally {fs.closeSync(fd);}
+    assert.throws(()=>store.tx(()=>assert.fail('live lock stolen')),{code:'A2A_BUSY'});
+    assert.equal(JSON.parse(fs.readFileSync(p,'utf8')).pid,process.pid);
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
+});
+for(const fault of ['timeout','lostAck']) test(`native file-create ${fault}: conservative retained lock, no callback (injected transport fault)`, {skip:!native,timeout:90000},()=>{
+  const root=fixtureRoot('native-ack-'); let callbacks=0, calls=0;
+  try {
+    const store=new Store(root,{createFile:p=>openPrivateNew(p,{helper:(op,target)=>windowsHelper(op,target,{run:(file,args,options)=>{
+      calls++;
+      if(fault==='timeout') return spawnSync(file,args,{...options,timeout:1});
+      const result=spawnSync(file,args,options);
+      assert.equal(result.status,0,'real creation must complete before discarding acknowledgment');
+      return {...result,stdout:''};
+    }})})});
+    assert.throws(()=>store.tx(()=>callbacks++),e=>e.creationUncertain===true);
+    assert.equal(calls,1); assert.equal(callbacks,0); assert.equal(fs.existsSync(store.lock),true);
+    assert.throws(()=>new Store(root).tx(()=>callbacks++),/lock incomplete/);
+    assert.equal(callbacks,0);
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
 });
 test('native protected root, inherited payload, transaction lock/temp and restart', {skip:!native,timeout:170000}, () => {
   const root=fixtureRoot('native-');
@@ -21,11 +54,36 @@ test('native protected root, inherited payload, transaction lock/temp and restar
     const identity=accountIdentity(); assert.match(identity,/^windows:S-1-5-/);
     assert.equal(identity,`windows:${windowsHelper('identity').sid}`);
     const store=new Store(root);
-    store.tx(s=>{windowsHelper('directory',store.lock); securePath(path.join(store.lock,'owner')); s.marker=7;});
+    const rename=fs.renameSync; let temps=0, callbacks=0;
+    fs.renameSync=(from,to)=>{securePath(from);temps++;return rename(from,to);};
+    try {store.tx(s=>{
+      callbacks++; windowsHelper('directory',store.lock); securePath(path.join(store.lock,'owner'));
+      assert.throws(()=>new Store(root).tx(()=>assert.fail('contended callback')),e=>e.code==='A2A_BUSY');
+      s.marker=7;
+    });} finally {fs.renameSync=rename;}
+    assert.equal(callbacks,1); assert.equal(temps,1);
     assert.equal(new Store(root).read().marker,7); securePath(store.file);
+    // Real replacement with an injected postcommit verification failure, not an
+    // ACL repair. The committed bytes survive and callback is never replayed.
+    const lstat=fs.lstatSync; let replaced=false, postCallbacks=0;
+    fs.renameSync=(...args)=>{rename(...args);replaced=true;};
+    fs.lstatSync=(p,...args)=>{if(replaced && p===store.file) throw Error('injected postcommit verification fault');return lstat(p,...args);};
+    try {assert.throws(()=>store.tx(s=>{postCallbacks++;s.marker=8;}),{code:'STORAGE_UNCERTAIN'});}
+    finally {fs.renameSync=rename;fs.lstatSync=lstat;}
+    assert.equal(postCallbacks,1); assert.equal(new Store(root).read().marker,8);
     const link=path.join(root,'hardlink'); fs.linkSync(store.file,link);
     assert.throws(()=>securePath(link)); fs.unlinkSync(link);
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
+});
+for(const mode of ['creation','evidence','reader']) test(`native explicit constructors/exclusivity and evidence roles: ${mode}`, {skip:!native,timeout:90000}, t=>{
+  const root=fixtureRoot('native-create-');
+  try {
+    const r=spawnSync(path.join(process.env.SystemRoot,'System32/WindowsPowerShell/v1.0/powershell.exe'),
+      ['-NoLogo','-NoProfile','-NonInteractive','-File',fileURLToPath(new URL('./windows-create-native.ps1',import.meta.url)),root,mode],
+      {encoding:'utf8',timeout:80000,shell:false});
+    if(mode==='evidence' && r.status===77) {t.skip('Token cannot construct an Administrators-owned synthetic evidence fixture; descriptor-policy coverage is separate');return;}
+    assert.equal(r.status,0,r.stdout+r.stderr); assert.match(r.stdout,/native-fixtures passed/);
+  } finally {fs.rmSync(root,{recursive:true,force:true});}
 });
 test('native actual ordinary-grant and junction negatives, trusted OS descriptor', {skip:!native,timeout:90000}, () => {
   const root=fixtureRoot('native-negative-');

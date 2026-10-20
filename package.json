@@ -17,7 +17,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/core.test.mjs tests/external.test.mjs tests/windows-inspection.test.mjs",
+    "test": "node --test --test-concurrency=1 tests/core.test.mjs tests/external.test.mjs tests/windows-inspection.test.mjs tests/windows-creation.test.mjs",
     "test:installed": "node --test --test-concurrency=1 tests/installed-pi.test.mjs",
     "test:windows": "node --test --test-concurrency=1 tests/windows-native.test.mjs",
     "probe": "node tests/load-probe.mjs"

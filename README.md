@@ -448,10 +448,36 @@ current user owner, protected DACL, inheritable user FullControl, before payload
 Existing roots must already meet that policy; they are never silently repaired.
 SYSTEM/Administrators grants are allowed, other grants refused. Null/empty DACL,
 unknown/object/callback ACEs, payload deny ACEs, absent user FullControl,
-unprotected root, reparse points and wrong owner fail closed. New files/lock/
-temporary state and worker transcripts inherit only from verified directories;
-files are verified before payload write, and existing files/transcripts checked.
+unprotected root, reparse points and wrong owner fail closed.
 Directory FullControl must be inheritable by both files and directories.
+
+New lock-owner and UUID temporary files use the .NET Framework `FileStream`
+CreateNew constructor with explicit `FileSecurity`: current User SID owner,
+protected user FullControl DACL, no inherited entries, empty before acknowledgment.
+Node opens **r+ only**, checks empty length, regular/single-link type, opened/path
+identity and actual security before payload. No fallback create/truncate or ACL
+repair. The ledger receives that descriptor through temp rename; postreplacement
+security/identity failure is potentially committed (`STORAGE_UNCERTAIN`).
+Lock directories use fixed `CreateDirectoryW` with SECURITY_ATTRIBUTES: existing
+directory is contention, never a successful acquisition. The fixed C# wrapper
+compiles with Framework Add-Type using a new protected compiler-scratch leaf
+and invocation-local TEMP/TMP, not ambient Temp. Compiler leftovers are not
+recursively erased; failure stops before acquisition. Helper/compilation policy
+must already permit this; never bypass it. Timeout/lost acknowledgment or failed
+new-file verification retains the possibly created objects and lock for manual
+reconciliation, without adoption, deletion or automatic create retries.
+
+Pi transcript evidence is a **separate read-only role**. Only current User SID
+or built-in Administrators may own the evidence file/container; allowed grants
+remain limited to current user/SYSTEM/Administrators, with no ordinary readers
+or writers. SYSTEM/TrustedInstaller/other ownership is not an evidence exception.
+Safe ancestors, reparse/type/single-link checks, registered account namespace,
+session header and exact complete saved-message association remain required.
+Runtime registration, native replies and external scans consistently use this
+role; unsafe/missing evidence stays uncertain. It does not authorize Store
+ownership, mutation or launch. Store roots/files/locks/temp remain strictly
+current-user-owned. Pi SessionManager creates/appends/rewrites its own transcript
+unchanged; pi-a2a never precreates or repairs it as a persistence shortcut.
 
 Ancestors and launch files may additionally be owned by the exact Windows
 TrustedInstaller service SID and carry its privileged grants. This exception is
@@ -559,16 +585,23 @@ Descriptor tests execute the actual shared PowerShell policy with genuine .NET
 ACL objects, including TrustedInstaller positive OS roles and rejected payload/
 untrusted owners; synthetic owners are **not** filesystem-owner proof. The
 focused test also verifies actual OS launch descriptors without modifying them.
-It does not claim null/unknown-ACE, foreign filesystem-owner, sharing-violation,
-RPC worker or consumption coverage; installed-Pi and probe commands are separate.
+Additional native cases exercise exclusive .NET empty-file creation, existing
+file/lock rejection, actual lock-owner/temp/replacement descriptors and a real
+Administrators-owned synthetic evidence fixture accepted for evidence but
+rejected for Store. Tokens unable to create that owner fixture explicitly skip
+only that case; genuine descriptor-policy cases are labeled separately. Extra
+ordinary-reader evidence/Store rejection must not be skipped. Portable lost-ack,
+timeout and postcommit fault seams are mocks, not native execution evidence.
+It does not claim null/unknown-ACE, sharing-violation, RPC worker or consumption
+coverage; installed-Pi and probe commands are separate.
 Tests modify only newly owned fixtures. Do not bypass execution policy if a
 helper is blocked. Native acceptance still requires successful host evidence,
 not a passing non-Windows skip or portable mock. Full portable suites may be
 much slower on Windows because each security check launches PowerShell.
-An elevated token whose default new-file owner is Administrators can fail the
-current-user payload-owner check even below a protected current-user-owned root.
-That is unsupported, not authority to accept privileged-owned payloads or change
-the token/ACL policy. Likewise, an installed Node with ordinary-user write grants
+Explicit creation is intended to avoid an elevated token's Administrators default
+owner for Store objects, without changing token defaults or accepting that owner
+for Store. This implementation is still a candidate pending native execution.
+An installed Node with ordinary-user write grants
 fails trusted launch verification; do not repair its installation to run a test.
 
 Optional installed-Pi checks are separate from `npm test`. Point the package
@@ -603,7 +636,8 @@ envelopes and correlation; `opencode.mjs` owns HTTP/SSE; `worker.mjs` owns RPC
 workers; `external.mjs` owns external claims/receipts/proof; `ledger.mjs` owns
 compact retention and capacity constants; `machine.mjs` owns
 strict stdin parsing; `platform.mjs` and `windows-security.ps1` implement the
-account/security seam; `launch.mjs` validates native Node/Pi JS launch;
+account/security seam; `private-create.mjs` and `windows-create.ps1` implement
+exclusive private creation; `launch.mjs` validates native Node/Pi JS launch;
 `cli.mjs` is the trusted local companion. Bug reports should use a
 minimal synthetic reproduction and host versions, never private state.
 
