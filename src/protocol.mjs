@@ -28,6 +28,7 @@ export function admit(s, r) {
   }
   if (Object.values(s.requests).some(x => x.to === r.to && x.expectReply && !terminal(x))) throw Error('Target already has a reply-bearing request; wait for automatic return');
   if (Object.keys(s.requests).length >= 2048) throw Error('Request limit reached; offline archive required');
+  if (Buffer.byteLength(JSON.stringify(s)) > 12 * 1024 * 1024) throw Error('Admission capacity reached; retain existing identities');
   s.requests[r.id] = r; return r;
 }
 export function assistantText(m) { return (m?.content ?? []).filter(x => x.type === 'text').map(x => x.text).join(''); }

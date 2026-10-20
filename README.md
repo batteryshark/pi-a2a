@@ -17,8 +17,9 @@ is a 320×320 alpha-aware resampled derivative, not a separately designed tiny i
 
 ## Requirements and setup
 
-Use **Pi 1.0.4** and **Node 22.19.0+** on a POSIX host. Other Pi versions and
-Windows need verification. Workers require `pi` on PATH (or `PI_A2A_PI_BIN`)
+Use **Pi 1.0.4** and **Node 22.19.0+** on a POSIX host. Other Pi versions need
+verification. Native Windows is explicitly refused with `UNSUPPORTED_SECURITY` until verified native
+account/ACL support is implemented. Workers require `pi` on PATH (or `PI_A2A_PI_BIN`)
 and existing authorized Pi model configuration. `--offline` disables startup
 network discovery; it does not make model requests offline or sandbox code.
 
@@ -71,7 +72,7 @@ pi --no-extensions --no-mcp -e ./index.ts
 ```
 
 Set that same variable in the second Pi's environment before starting it.
-Without an override, the extension uses `.state` next to its own `index.ts`;
+Without an override, the extension uses `.state-v2` next to its own `index.ts`;
 separate installed copies would otherwise have separate mailboxes. Do not open
 the same Pi transcript in two processes. A mailbox is not a process launcher.
 
@@ -160,7 +161,119 @@ endpoint. Rotation affects only new sends; uncertain work isn't replayed to
 a replacement chief. Replies return to the initiating Pi. OpenCode remains
 responsible for its own model/auth routing.
 
-### Trusted local reverse-initiation companion
+### Machine companion v1 (0.2.0 candidate)
+
+From the clone root, with the same `PI_A2A_STATE` as the receiving Pi:
+
+```sh
+node cli.mjs machine < private-request.json
+```
+
+Supply **exactly one flat JSON object on stdin, then EOF**. Never put the text,
+reason, context, or routing identity in argv. These are complete example objects
+with fictional identities (send, then independent status/cancel invocations):
+
+```json
+{"v":1,"op":"send","caller":"docket","id":"example:1","to":"pi/fake_receiver","text":"Synthetic wake","delivery":"queue","expectReply":false}
+```
+```json
+{"v":1,"op":"status","caller":"docket","id":"example:1"}
+```
+```json
+{"v":1,"op":"cancel","caller":"docket","id":"example:1"}
+```
+
+All shown fields are required; all other fields are rejected. `caller` matches
+`[a-z][a-z0-9-]{0,47}`; `id` matches `[A-Za-z0-9._:-]{1,96}`. Text is preserved
+exactly, must be nonblank, and is limited to 32768 UTF-8 bytes. Stdin is limited
+to 262144 bytes and 10 seconds through EOF. Nested values, duplicate keys,
+malformed UTF-8, BOM, lone surrogates and trailing frames are rejected.
+`expectReply` must be **false**; v1 never subscribes to replies or waits for an
+answer. Only an existing capable `pi/<id>` is allowed, not OpenCode, chief,
+titles or launch. `queue` maps to Pi `followUp`; `steer` maps to `steer`.
+External wakes bypass native reply-bearing serialization, including while busy.
+
+One newline-terminated JSON object (at most 8192 bytes) is written to stdout;
+machine errors never echo input, exception text, paths, transcripts or answers.
+Success shape (fact values vary):
+
+```json
+{"v":1,"ok":true,"receipt":{"state":"admitted","facts":{"admitted":true,"claimed":false,"injected":false,"observed":false,"consumed":false,"historicalUncertainty":false},"evidence":"not_checked","cancelAvailable":true,"retry":"same_key_only"}}
+```
+
+Error shape: `{"v":1,"ok":false,"error":"CONFLICT","retry":"same_key_only"}`.
+Exit 0 means the operation was answered, **not delivery or task success**.
+
+| Exit | Fixed machine error codes |
+| --- | --- |
+| 2 | `INVALID_JSON`, `SCHEMA`, `INPUT_LIMIT`, `INPUT_TIMEOUT` |
+| 3 | `UNKNOWN`, `UNAVAILABLE`, `UNSUPPORTED_TARGET`, `UNSUPPORTED_SECURITY`, `CAPACITY` |
+| 4 | `CONFLICT`, `CANCELLED`, `TOO_LATE` |
+| 5 | `A2A_BUSY` (retry same caller/id) |
+| 6 | `STORAGE_UNCERTAIN` (potentially committed; look up same caller/id) |
+
+Caller namespace derives from the trusted POSIX account and application label;
+the label is not executable authentication. A domain-separated key identifies
+caller/id, and a canonical digest pins to/text/delivery/expectReply. Identical
+send returns the retained receipt **before** target liveness checks, even offline;
+any immutable change conflicts. Different caller labels are independent.
+Unknown status is `UNKNOWN`, not a cancellation barrier.
+
+Current `state` is `admitted`, `injected`, `consumed`, `cancelled`, `uncertain`, or
+`failed`. (`pending` is reserved; not currently emitted.) Facts are monotonic:
+admitted means committed ledger admission; claimed means irreversible exclusive
+injection intent; injected means facade return or stronger saved evidence;
+observed means exact message event or stronger saved evidence. **Consumed alone
+means exact saved-session intake**: a complete newline JSONL entry under the
+right session header, distinct `pi-a2a-external-v1` custom type, internal ID,
+claim token, immutable digest and deterministic content, with receipt proof
+persisted before reporting it. Neither message_start/end, in-memory entries,
+facade return, assistant output nor settlement is saved-consumption proof.
+Pi 1.0.4 emits message_end before its writer appends. Hooks return before deferred
+reconciliation reads the file; status may safely advance saved-proof scanning.
+
+`evidence` is one of `not_checked`, `missing`, `unsafe`, `changed`,
+`partial_header`, `session_mismatch`, `oversized_record`, `invalid_record`,
+`partial_record`, `scanning`, `absent`, `unreadable`, `saved_exact`, `deadline`,
+`owner_unavailable`. Scans read at most 256 KiB per reconciliation, with 8 KiB
+header and 224 KiB record bounds (including worst-case escaped valid text). Missing/partial/oversized/ambiguous evidence
+never proves intake; progress may require subsequent status calls/sweeps.
+The receipt contains no payload or transcript path. Saved intake is historical,
+not model understanding, execution success, or an fsync/power-loss guarantee.
+
+Admission, cancel and claim use the **same transaction lock**. Cancel before
+claim persists a permanent barrier; unknown cancellation creates a tombstone.
+Delayed sends cannot revive it. After claim cancellation is `TOO_LATE`, even
+before the facade call. No queue clearing or record deletion occurs. One key
+permits at most one claim and facade attempt; lost queues, crashes and async
+facade failures are never automatically replayed. Claim initially records
+uncertainty about the effect; historicalUncertainty stays true even if later
+proof resolves to consumed. Restart/async failure resolves to uncertain without
+proof, including when a proof scan finds no exact saved entry. The five-minute deadline is definite failed only before claim; after
+claim it is uncertain, not cancellation. Never silently retry with a new ID.
+
+Owners advertise capability, persistence path, random epoch and heartbeat;
+admission and claim both check them. A live PID alone does not qualify an old
+owner. Changed owner epoch fails pending work rather than retargeting it.
+No-session mode cannot receive new machine wakes. There is no lock stealing.
+External identities and tombstones are retained, maximum 128, with byte admission
+ceilings reserving transition space (external admission ceiling 6 MiB, plus at
+most one bounded new record; native collections capped at 8 MiB). Capacity rejects **new identities**, not
+status/transitions/idempotent operations on existing ones. There is no TTL,
+eviction, automatic archive, or ID reuse. Reserve IDs in the caller's durable
+outbox; status UNKNOWN after a lost commit response is not authority to mint a
+new ID. Same-key lookup/retry is the recovery path.
+
+### Explicit 0.1 upgrade boundary
+
+Schema v2 rejects v1 state; **there is no automatic migration**. Stop all old
+owners and reconcile legacy work first. Retain the old mailbox unchanged for
+manual inspection; configure every upgraded participant to the same **empty new
+private root** (default `.state-v2`). Do not point 0.1 owners at it. Old readers
+reject v2. Native tool/worker/bridge collections remain separate and retain their
+original semantics; legacy seen/notified flags are never external intake proof.
+
+### Legacy human companion (deprecated)
 
 From the clone root, with the same `PI_A2A_STATE` as the receiving Pi:
 
@@ -180,6 +293,9 @@ doesn't understand Pi addresses. Offline Pi needs its real owner process
 resumed before a new send can be admitted.
 
 ## Delivery, recovery and trust
+
+This section describes the **native tool/reply** lifecycle. Machine external
+wakes instead use the stricter, no-automatic-replay contract above.
 
 Admission is persisted by atomic rename and fsync before injection, spawning
 or HTTP submission. Delivery is **at-least-once with admission deduplication**,
@@ -258,8 +374,11 @@ PI_A2A_PI_PACKAGE=/workspace/pi-install/node_modules/@earendil-works/pi-coding-a
 PI_A2A_PI_BIN=pi npm run probe
 ```
 
-The first calls Pi's real busy-queue facade and JSONL writer with synthetic
-events; it doesn't run a model. The second loads the package directory through
+The first includes the original synthetic native reply regression plus a genuine
+installed AgentSession/Agent loop and writer with a local synthetic stream and
+network access explicitly forbidden. It proves external message_end is not
+consumed before append and three queue/steer wakes become consumed after real
+saved writes. It is not a live provider test. The second loads the package directory through
 its public manifest in an isolated temporary project/agent directory, verifies
 all four tools and session registration/shutdown, and makes zero model
 requests. It has a 20-second watchdog with bounded owned-process escalation.
@@ -275,7 +394,9 @@ automatic reverse bridge, OS sandbox or exactly-once guarantee is provided.
 Source map: `index.ts` registers tools/hooks; `src/runtime.mjs` handles mailbox
 delivery and settlement; `store.mjs` owns transactions; `protocol.mjs` owns
 envelopes and correlation; `opencode.mjs` owns HTTP/SSE; `worker.mjs` owns RPC
-workers; `cli.mjs` is the trusted local companion. Bug reports should use a
+workers; `external.mjs` owns external claims/receipts/proof; `machine.mjs` owns
+strict stdin parsing; `platform.mjs` is the account/security seam;
+`cli.mjs` is the trusted local companion. Bug reports should use a
 minimal synthetic reproduction and host versions, never private state.
 
 ## License

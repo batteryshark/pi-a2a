@@ -10,7 +10,7 @@ export default function (pi: ExtensionAPI) {
   const base = path.dirname(fileURLToPath(import.meta.url));
   pi.on('session_start', async (_event, ctx) => {
     if (runtime) await runtime.close();
-    runtime = new Runtime({ root: process.env.PI_A2A_STATE ?? path.join(base, '.state'), session: ctx.sessionManager.getSessionId(),
+    runtime = new Runtime({ root: process.env.PI_A2A_STATE ?? path.join(base, '.state-v2'), session: ctx.sessionManager.getSessionId(),
       cwd: ctx.cwd, extension: path.join(base, 'index.ts'), transcript: () => ctx.sessionManager.getSessionFile(),
       sendMessage: (message, options) => pi.sendMessage(message, options) });
     runtime.start();

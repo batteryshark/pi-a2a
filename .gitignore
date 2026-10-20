@@ -1,5 +1,6 @@
 # Runtime mailboxes, transcripts and probes are private.
 .state/
+.state-v2/
 state.json
 transaction.lock/
 *.jsonl

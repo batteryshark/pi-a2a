@@ -3,6 +3,8 @@ import { Store, live, key } from './store.mjs';
 import { address, envelope, admit, terminal, assistantText, clip } from './protocol.mjs';
 import { OpenCode, chiefTarget } from './opencode.mjs';
 import { createWorker } from './worker.mjs';
+import { id } from './store.mjs';
+import { claim, content, TYPE, reconcileProof } from './external.mjs';
 
 export class Runtime {
   constructor({ root, session, cwd, sendMessage, extension, piBin = process.env.PI_A2A_PI_BIN ?? 'pi', oc, parent = process.env.PI_A2A_PARENT,
@@ -14,6 +16,7 @@ export class Runtime {
     this.children = new Map(); this.active = null; this.closed = false; this.working = false;
     this.spawnImpl = spawnImpl;
     this.transcript = transcript; this.inFlight = new Set(); this.observedReplies = new Set(); this.pendingWrites = new Map();
+    this.epoch = id(); this.externalWrites = new Map();
   }
   start() {
     this.store.tx(s => {
@@ -21,12 +24,17 @@ export class Runtime {
       if (old?.online && live(old.pid)) throw Error('Transcript already owned by another Pi process');
       if (!old && Object.keys(s.sessions).length >= 128) throw Error('Session registry limit reached; offline archive required');
       s.sessions[this.self] = { address: this.self, cwd: this.cwd, pid: process.pid, online: true,
+        externalV1: true, epoch: this.epoch, heartbeat: this.now(), persistence: !!this.transcript(), transcript: this.transcript(),
         ...(this.parent ? { parent: this.parent } : {}), ...(this.create ? { create: this.create } : {}) };
       for (const r of Object.values(s.requests)) if (r.to === this.self && r.injected && !terminal(r)) {
         r.status = 'blocked'; r.reason = 'Reload interrupted an admitted turn; no automatic replay. Operator must reconcile.';
       }
+      for (const r of Object.values(s.external)) if (r.to === this.self && r.claim && !r.proof) {
+        r.state = 'uncertain'; r.uncertainty = true;
+      }
     });
     this.watcher = fs.watch(this.store.root, (_event, name) => { if (name === 'state.json' || name === 'transaction.lock') this.schedule(); });
+    this.watcher.on('error', () => { this.watcher?.close(); });
     this.sweep = setInterval(() => this.schedule(), 30000); this.sweep.unref();
     this.schedule();
     if (this.parent && this.create) {
@@ -40,9 +48,9 @@ export class Runtime {
     process.kill(pid, 'SIGTERM');
     setTimeout(() => process.kill(pid, 'SIGKILL'), 2000);
   }
-  schedule() {
+  schedule(delay = 30) {
     if (this.closed || this.scheduled) return;
-    this.scheduled = setTimeout(() => { this.scheduled = null; this.reconcile().catch(() => {}); }, 30);
+    this.scheduled = setTimeout(() => { this.scheduled = null; this.reconcile().catch(() => {}); }, delay);
   }
   async send(to, text, opts = {}) {
     let pinned;
@@ -100,6 +108,7 @@ export class Runtime {
     if (this.working || this.closed) return;
     this.working = true;
     try {
+      this.reconcileExternal();
       for (const [id, data] of this.pendingWrites) this.hookWrite(id, data);
       this.completeCandidate();
       let requests = Object.values(this.store.read().requests);
@@ -138,10 +147,22 @@ export class Runtime {
             display: true, details: { request: r.id } }, { triggerTurn: true, deliverAs: r.delivery });
         }
       }
-    } finally { this.working = false; }
+    } finally {
+      this.working = false;
+      // fs.watch is advisory (including lock-release events). Retry only local
+      // idempotent writes, never admission or an injection claim/effect.
+      if (this.pendingWrites.size || (this.active?.candidate && (this.active.candidateAttempts ?? 0) < 32)) this.schedule(250);
+    }
   }
   message(event) {
     const m = event.message;
+    if (m?.customType === TYPE) {
+      if (this.active && !this.active.candidate) { this.active.focus = false; this.active.answer = ''; this.active.assistantSeen = false; }
+      // Event observation is not append evidence. Defer reconciliation until the hook returns.
+      const r = Object.values(this.store.read().external).find(r => r.internal === m.details?.internal && r.claim === m.details?.claim && r.digest === m.details?.digest && m.content === content(r));
+      if (r) this.externalWrites.set(r.internal, { ...this.externalWrites.get(r.internal), observed: true });
+      this.schedule(); return;
+    }
     if (m?.customType === 'pi-a2a-reply') {
       const child = this.store.read().requests[m.details?.request];
       if (child?.from === this.self && terminal(child) && m.details?.replyId === `${child.id}-reply` && !this.observedReplies.has(child.id)) {
@@ -205,6 +226,40 @@ export class Runtime {
     return { untrusted: true, excerpt: clip(JSON.stringify(Object.values(this.store.read().requests).filter(r => r.to === to || r.from === to).slice(-limit))) };
   }
   createWorker(opts) { return createWorker(this, opts); }
+  reconcileExternal() {
+    // One transaction for local monotonic updates, proof, and heartbeat. Avoid a
+    // write-triggered watcher loop when nothing has changed.
+    const before = this.store.read(); const peer = before.sessions[this.self];
+    const pending = this.now() - (this.lastExternalScan ?? 0) >= 1000 && Object.values(before.external).some(r => r.to === this.self && r.claim && !r.proof);
+    if (this.externalWrites.size || pending || this.now() - (peer?.heartbeat ?? 0) > 20000) {
+      this.store.tx(s => {
+        const p = s.sessions[this.self]; if (p?.epoch !== this.epoch) return;
+        p.heartbeat = this.now();
+        for (const r of Object.values(s.external)) {
+          const update = this.externalWrites.get(r.internal); if (update && !r.proof) Object.assign(r, update);
+          if (r.to === this.self && r.claim && !r.proof && this.now() >= r.deadline) { r.state = 'uncertain'; r.uncertainty = true; }
+        }
+        reconcileProof(s, this.self);
+      });
+      this.externalWrites.clear();
+      this.lastExternalScan = this.now();
+    }
+    for (const [k, r] of Object.entries(before.external)) if (r.to === this.self && !r.claim && r.state === 'admitted') {
+      const taken = claim(this.store, k, this.self, this.epoch, this.now());
+      if (!taken) continue;
+      // Claim is irreversible, including if the process dies before this call.
+      try {
+        const result = this.sendMessage({ customType: TYPE, content: content(taken), display: true,
+          details: { internal: taken.internal, claim: taken.claim, digest: taken.digest } },
+        { triggerTurn: true, deliverAs: taken.delivery === 'queue' ? 'followUp' : 'steer' });
+        Promise.resolve(result).then(() => {
+          if (!this.closed) { this.externalWrites.set(taken.internal, { ...this.externalWrites.get(taken.internal), injected: true, state: 'injected' }); this.schedule(); }
+        }, () => {
+          if (!this.closed) { this.externalWrites.set(taken.internal, { state: 'uncertain', uncertainty: true }); this.schedule(); }
+        });
+      } catch { this.externalWrites.set(taken.internal, { state: 'uncertain', uncertainty: true }); }
+    }
+  }
   async close() {
     if (this.closed) return; this.closed = true;
     clearTimeout(this.scheduled); clearInterval(this.sweep); clearTimeout(this.hardLimit); clearTimeout(this.requestLimit); this.watcher?.close(); this.eventAbort?.abort();

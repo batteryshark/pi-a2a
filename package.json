@@ -1,6 +1,6 @@
 {
   "name": "pi-a2a",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Local Pi session messaging and bounded workers with automatic replies and a loopback OpenCode bridge",
   "type": "module",
@@ -17,7 +17,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/core.test.mjs",
+    "test": "node --test --test-concurrency=1 tests/core.test.mjs tests/external.test.mjs",
     "test:installed": "node --test --test-concurrency=1 tests/installed-pi.test.mjs",
     "probe": "node tests/load-probe.mjs"
   },

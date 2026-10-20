@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { accountIdentity } from './platform.mjs';
 
 export const id = () => crypto.randomUUID();
-export const live = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+export const live = pid => { if (!Number.isSafeInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
 export function key(s) {
   if (typeof s !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(s)) throw Error('Invalid bounded ID');
   return s;
@@ -14,6 +15,7 @@ function secure(p, dir = false) {
 }
 export class Store {
   constructor(root) {
+    accountIdentity();
     if (!path.isAbsolute(root)) throw Error('Absolute state root required');
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     secure(root, true);
@@ -23,13 +25,13 @@ export class Store {
     this.lock = path.join(root, 'transaction.lock');
   }
   read() {
-    if (!fs.existsSync(this.file)) return { v: 1, sessions: {}, requests: {}, creates: {} };
+    if (!fs.existsSync(this.file)) return { v: 2, sessions: {}, requests: {}, creates: {}, external: {} };
     secure(this.file);
     const fd = fs.openSync(this.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     try {
       if (fs.fstatSync(fd).size > 16 * 1024 * 1024) throw Error('State size limit reached');
       const s = JSON.parse(fs.readFileSync(fd, 'utf8'));
-      if (s.v !== 1) throw Error('Unknown state version');
+      if (s.v !== 2) throw Error('Unknown state version; use an empty v2 root, no automatic migration');
       return s;
     } finally { fs.closeSync(fd); }
   }
@@ -45,12 +47,14 @@ export class Store {
       throw Error('Stale state lock: stop owners and reconcile lock manually; admission is not replayed');
     }
     const owner = path.join(this.lock, 'owner');
-    fs.writeFileSync(owner, JSON.stringify({ pid: process.pid }), { mode: 0o600, flag: 'wx' });
     const tmp = path.join(this.root, `${id()}.tmp`);
     try {
+      fs.writeFileSync(owner, JSON.stringify({ pid: process.pid }), { mode: 0o600, flag: 'wx' });
       const s = this.read(); const result = fn(s);
+      // Keep native growth from consuming the external transition reserve.
+      if (Buffer.byteLength(JSON.stringify({ sessions:s.sessions, requests:s.requests, creates:s.creates })) > 8 * 1024 * 1024) throw Error('Native state capacity reached');
       const body = JSON.stringify(s);
-      if (Buffer.byteLength(body) > 16 * 1024 * 1024) throw Error('State size limit reached; archive terminal records offline');
+      if (Buffer.byteLength(body) > 16 * 1024 * 1024) throw Error('State size limit reached; retained identities must not be evicted');
       const fd = fs.openSync(tmp, 'wx', 0o600);
       try { fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       fs.renameSync(tmp, this.file);
@@ -58,7 +62,7 @@ export class Store {
       return result;
     } finally {
       if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-      fs.unlinkSync(owner); fs.rmdirSync(this.lock);
+      if (fs.existsSync(owner)) fs.unlinkSync(owner); fs.rmdirSync(this.lock);
     }
   }
 }
