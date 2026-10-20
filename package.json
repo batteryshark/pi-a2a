@@ -1,0 +1,25 @@
+{
+  "name": "pi-a2a",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Pi session messaging and bounded workers with automatic replies and a loopback OpenCode bridge",
+  "type": "module",
+  "license": "MIT",
+  "author": "batteryshark",
+  "repository": { "type": "git", "url": "https://github.com/batteryshark/pi-a2a.git" },
+  "homepage": "https://github.com/batteryshark/pi-a2a#readme",
+  "bugs": { "url": "https://github.com/batteryshark/pi-a2a/issues" },
+  "keywords": ["pi-package", "pi-extension", "agent-to-agent", "opencode"],
+  "pi": { "extensions": ["./index.ts"] },
+  "files": ["index.ts", "cli.mjs", "src/", "assets/workstack-mark.png", "assets/workstack-mark-full.png", "README.md", "LICENSE", "RIGHTS.md"],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/core.test.mjs",
+    "test:installed": "node --test --test-concurrency=1 tests/installed-pi.test.mjs",
+    "probe": "node tests/load-probe.mjs"
+  },
+  "engines": { "node": ">=22.19.0" }
+}

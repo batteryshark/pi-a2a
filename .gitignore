@@ -1,0 +1,30 @@
+# Runtime mailboxes, transcripts and probes are private.
+.state/
+state.json
+transaction.lock/
+*.jsonl
+*.tmp
+.probe-*/
+.pi/
+node_modules/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+# Never stage local operational records or credentials.
+DESIGN.md
+PROJECT.md
+LEAD.md
+RESULTS.md
+COMPATIBILITY.md
+demo/
+evidence/
+results/
+history/
+private/
+operator*/
+*operator*.md
+chief.json
+auth.json
+release/
