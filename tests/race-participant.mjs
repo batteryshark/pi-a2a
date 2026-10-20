@@ -7,7 +7,16 @@ for await (const chunk of process.stdin) input+=chunk;
 const job=JSON.parse(input), store=new Store(job.dir);
 const original=store.tx.bind(store);
 store.tx=fn=>original(s=>{
-  if(job.hold) { process.send({type:'locked'}); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,250); }
+  if(job.hold) {
+    process.send({type:'locked'});
+    const deadline=Date.now()+5000, pause=new Int32Array(new SharedArrayBuffer(4));
+    // Synchronous Store callback cannot receive IPC. Parent creates this owned
+    // fixture marker ONLY after observing the other participant's A2A_BUSY.
+    while(!fs.existsSync(job.release)) {
+      if(Date.now()>=deadline) throw Error('Parent release deadline exceeded');
+      Atomics.wait(pause,0,0,10);
+    }
+  }
   return fn(s);
 });
 process.send({type:'ready'});

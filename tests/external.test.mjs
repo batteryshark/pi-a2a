@@ -167,7 +167,48 @@ test('50,000 realistic permanent compact identities retain lookup/conflict/cance
   assert.equal(operate(new Store(f.dir),q).state,'consumed');
   assert.throws(()=>operate(f.store,{...q,op:'cancel'}),{code:'TOO_LATE'});
   assert.equal(capabilities().maxRetainedIdentities,50000);
+  // Real Runtime admission, not just timeout reconciliation, with >12 MiB of
+  // retained external metadata and a genuinely registered/live Pi peer.
+  const retained=hash(JSON.stringify(f.store.read().external)), delivered=[];
+  let ocCalls=0;
+  const sender=new Runtime({root:f.dir,session:'native-sender',cwd:f.dir,sendMessage:()=>{},oc:{
+    url:'http://127.0.0.1:1',events:async()=>{},send:async r=>{
+      assert.equal(f.store.read().requests[r.id].status,'admitted'); ocCalls++;
+    }
+  }});
+  const peer=new Runtime({root:f.dir,session:'native-peer',cwd:f.dir,sendMessage:m=>delivered.push(m)});
+  try {
+    sender.start(); peer.start();
+    const pi=await sender.send(peer.self,'Synthetic native admission',{id:'retained-native',expectReply:false});
+    assert.equal(pi.status,'admitted');
+    await peer.reconcile();
+    assert.equal(delivered.length,1); assert.equal(delivered[0].details.request,pi.id);
+    const oc=await sender.send('oc/ses_fixture','Synthetic fake OC admission',{id:'retained-oc',expectReply:false});
+    assert.equal(oc.status,'sent'); assert.equal(ocCalls,1);
+  } finally {await sender.close(); await peer.close();}
+  assert.equal(Object.keys(f.store.read().external).length,50000);
+  assert.equal(hash(JSON.stringify(f.store.read().external)),retained);
   t.diagnostic(`retained identities=50000, ledger bytes=${bytes}, active payloads=0; late exact proof resolved after compaction`);
+});
+
+test('candidate-inclusive native byte limit rejects new Runtime Pi/OC admission without effects or byte changes', {timeout:20000}, async()=>{
+  const dir=root(), store=new Store(dir); let ocCalls=0;
+  const sender=new Runtime({root:dir,session:'sender',cwd:dir,sendMessage:()=>{},oc:{url:'http://127.0.0.1:1',send:async()=>{ocCalls++;}}});
+  const peer=new Runtime({root:dir,session:'peer',cwd:dir,sendMessage:()=>{}});
+  try {
+    sender.start(); peer.start();
+    store.tx(s=>{
+      const size=Buffer.byteLength(JSON.stringify({sessions:s.sessions,requests:s.requests,creates:s.creates}));
+      s.creates.padding='x'.repeat(NATIVE_BYTES-size-512);
+    });
+    const before=hash(fs.readFileSync(store.file));
+    for(const to of [peer.self,'oc/ses_fixture']) {
+      await assert.rejects(sender.send(to,'x'.repeat(32768),{id:to===peer.self?'pi-limit':'oc-limit'}),/Native state capacity reached/);
+      assert.equal(hash(fs.readFileSync(store.file)),before);
+    }
+    assert.equal(ocCalls,0); assert.deepEqual(store.read().requests,{});
+    assert.equal(fs.existsSync(store.lock),false);
+  } finally {await sender.close(); await peer.close();}
 });
 
 // Real overlapping owned processes. First holds the acquired transaction lock
@@ -185,10 +226,18 @@ async function race(dir, first, second) {
   }
   const watchdog=setTimeout(()=>{for(const p of children) if(p.exitCode===null) p.kill('SIGKILL');},10000);
   try {
-    const a=participant({...first,hold:true}), b=participant(second);
+    const release=path.join(dir,'race-release');
+    const a=participant({...first,hold:true,release}), b=participant(second);
     await Promise.all([a.wait('ready'),b.wait('ready')]); a.p.send('go');
     await a.wait('locked'); b.p.send('go');
-    const results=await Promise.all([a.wait('result'),b.wait('result')]);
+    const contended=await b.wait('result');
+    assert.equal(contended.error,'A2A_BUSY','second operation must actually contend before release');
+    assert.equal(a.p.exitCode,null);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir,'transaction.lock','owner'),'utf8')).pid,a.p.pid);
+    assert.equal(fs.existsSync(release),false);
+    fs.writeFileSync(release,'release',{flag:'wx',mode:0o600});
+    const results=[await a.wait('result'),contended];
+    assert.equal(results[0].error,undefined,'lock holder must finish its operation');
     await Promise.all([a.done,b.done]);
     for(let i=0;i<results.length;i++) if(results[i].error==='A2A_BUSY') {
       const job=[first,second][i];
@@ -201,13 +250,15 @@ async function race(dir, first, second) {
     await Promise.all(children.map(p=>p.exitCode!==null?Promise.resolve():new Promise(resolve=>{p.once('exit',resolve);p.kill('SIGKILL');})));
   }
 }
-test('simultaneous send/send, send/cancel and both cancel/claim orders preserve durable barriers', {timeout:30000}, async()=>{
+test('simultaneous send/send, send/cancel and both cancel/claim orders preserve durable barriers', {timeout:30000}, async t=>{
   for(const actions of [['send','send'],['cancel','send'],['send','cancel'],['cancel','claim'],['claim','cancel'],['claim','claim']]) {
     const dir=root(), store=new Store(dir);
     store.tx(s=>{s.sessions['pi/target']={externalV1:true,persistence:true,epoch:'race-epoch',online:true,pid:process.pid,heartbeat:Date.now(),transcript:path.join(dir,'session.jsonl')};});
     if(actions.includes('claim')) operate(store,send());
     const jobs=actions.map(action=>({action:action==='claim'?'claim':'operate',x:action==='send'||action==='claim'?send():query('cancel')}));
     const result=await race(dir,...jobs);
+    const expectedError=actions[0]==='cancel'&&actions[1]==='send'?'CANCELLED':actions[0]==='claim'&&actions[1]==='cancel'?'TOO_LATE':undefined;
+    assert.equal(result[1].error,expectedError);
     const saved=store.read().external[requestKey(send())];
     const claimed=result.filter(r=>r.value?.claim).length;
     assert.ok(claimed<=1);
@@ -222,6 +273,7 @@ test('simultaneous send/send, send/cancel and both cancel/claim orders preserve 
     }
     if(saved.claim) assert.throws(()=>operate(new Store(dir),query('cancel')),{code:'TOO_LATE'});
   }
+  t.diagnostic('6 parent-released races observed A2A_BUSY while the first participant owned the lock; retries began only after both children exited');
 });
 test('atomic cancel vs claim barriers, immutable fields, expiry, owner epoch and legacy rejection', async () => {
   const f=setup(); try {
