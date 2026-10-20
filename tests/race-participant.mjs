@@ -22,7 +22,7 @@ store.tx=fn=>original(s=>{
 process.send({type:'ready'});
 process.once('message',()=>{
   try {
-    const value=job.action==='claim'?claim(store,requestKey(job.x),'pi/target','race-epoch',Date.now()):operate(store,job.x);
+    const value=job.action==='claim'?claim(store,requestKey(job.x),'pi/target','race-epoch',Date.now):operate(store,job.x);
     if(job.action==='claim' && value) fs.appendFileSync(path.join(job.dir,'invocations'),'facade-attempt\n');
     process.send({type:'result',value});
   } catch(e) {process.send({type:'result',error:e.code??'UNEXPECTED'});}

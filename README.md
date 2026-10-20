@@ -253,6 +253,13 @@ upgrade. `capable` means external-v1 + persistence + owner epoch are advertised;
 old owners return false. `live` independently means online, a valid positive
 PID not known dead, and a heartbeat within 65 seconds (at most 1 second future
 skew). Unknown process liveness is conservative, **not proof of ownership**.
+Lookup samples its clock after the verified read. Admission/claim sample inside
+their transaction callback after identity/security/lock acquisition, using the
+same fresh decision time for deadline, heartbeat and epoch checks. There is no
+caller JSON timestamp or extra freshness slack. Known-key dedup/cancel barriers
+still precede target checks. A trusted library test may supply a clock function
+(legacy fixed numeric fixture times are also supported); production defaults
+never capture `Date.now()` before slow Store work.
 Offline capable owners can return `capable:true,live:false`. Busy/idle,
 directory, transcript paths and payloads are deliberately omitted.
 
@@ -300,6 +307,28 @@ claim it is uncertain, not cancellation. Never silently retry with a new ID.
 Owners advertise capability, persistence path, random epoch and heartbeat;
 admission and claim both check them. A live PID alone does not qualify an old
 owner. Changed owner epoch fails pending work rather than retargeting it.
+Reconciliation is bounded to eight work units per pass, round-robin across local
+updates, native deadlines/outcomes/returns/dispatch and external claims/proof.
+Each unit has at most one mutation transaction; verified reads and transcript
+scans are also separated by real timer turns outside locks. Per-lane cursors
+prevent a stable prefix from monopolizing a backlog. The working guard remains
+held across turns; close cancels pending turns. Actionable remaining work retries
+after 250 ms, not an unbounded synchronous drain. Busy operations stop the pass;
+only local idempotent updates retry, and retained claims prevent facade replay.
+Network/facade promises are not awaited by this scheduler. Late results require
+the same Runtime context and a fresh owned transaction before persistence.
+
+Only the live registered Runtime's **exact PID + owner epoch + online record**
+can renew its own heartbeat during normal owned work, at the unchanged 20-second
+threshold. It cannot set online, renew another peer, or survive replacement.
+Companion operations and pure lookup never renew a target. The last-heartbeat
+hint controls scheduling only: every owned mutation still verifies the actual
+record and all Store security checks. Missing-proof scans use actual event work
+and the existing 30-second sweep, not a self-write polling loop. Watch events
+during a pass are advisory; the final verified read detects actionable backlog,
+and the existing sweep recovers missed events. No security-check batching/cache
+is introduced. A timer yield cannot preempt a single slow synchronous Store
+unit; native latency/availability and independent-target proof remain required.
 No-session mode cannot receive new machine wakes. There is no lock stealing.
 External identities and tombstones are retained permanently: **50,000 globally
 per shared ledger**, not per caller or target. Active payloads have a separate
@@ -626,7 +655,17 @@ The first includes the original synthetic native reply regression plus a genuine
 installed AgentSession/Agent loop and writer with a local synthetic stream and
 network access explicitly forbidden. It proves external message_end is not
 consumed before append and three queue/steer wakes become consumed after real
-saved writes. It is not a live provider test. The second loads the package directory through
+saved writes on the validated host. Its caller and receiver share one Runtime:
+explicit real timer turns and completion of normal reconciliation between
+admissions model an independently scheduled caller, not throughput or native
+availability proof. No manual heartbeat/capability update is used. It is not a
+live provider test. Set `PI_A2A_TEST_RETAIN_FAILURE=1` to retain owned installed-Pi
+and native constructor/evidence fixtures on failure; use a protected test parent
+outside Git and keep all logs/transcripts private. Default cleanup is unchanged.
+The public PowerShell fixture checker retains its original `-File` invocation;
+failure diagnostics capture op, expected/actual status and raw helper stdout/
+stderr, without replacing failed assertions or repairing ACLs.
+The second loads the package directory through
 its public manifest in an isolated temporary project/agent directory, verifies
 all four tools and session registration/shutdown, and makes zero model
 requests. It has a 20-second watchdog with bounded owned-process escalation.

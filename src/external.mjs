@@ -8,8 +8,10 @@ export const capabilities = () => ({ protocol:1, contract:'pi-a2a-external-v1', 
   delivery:['queue','steer'], expectReply:false, maxCaller:48, maxRequestId:96, maxTextBytes:32768, maxInputBytes:262144, maxOutputBytes:8192,
   maxRetainedIdentities:IDENTITIES, maxActivePayloads:ACTIVE, capacityScope:'shared_ledger', maxStateBytes:STATE_BYTES,
   inspection:'read_only', targetSnapshot:true, reservation:false });
-export function lookup(store, to, now = Date.now()) {
+const sample = clock => { const value = typeof clock === 'function' ? clock() : clock; if (!Number.isFinite(value)) throw fault('UNAVAILABLE'); return value; };
+export function lookup(store, to, clock = Date.now) {
   const p = store.read().sessions[to];
+  const now = sample(clock); // AFTER read/security, never an API-entry timestamp
   const capable = !!(p?.externalV1 === true && p.persistence === true && typeof p.epoch === 'string');
   return { to, exists:!!p, live:!!(p?.online && live(p.pid) && Number.isFinite(p.heartbeat) && p.heartbeat <= now + 1000 && now - p.heartbeat <= 65000),
     capable, snapshot:true, reservation:false };
@@ -31,9 +33,10 @@ function capable(p, now, epoch) {
   if (p?.externalV1 !== true || p.persistence !== true || typeof p.epoch !== 'string') throw fault('UNSUPPORTED_TARGET');
   if (!p.online || !live(p.pid) || !Number.isFinite(p.heartbeat) || p.heartbeat > now + 1000 || now - p.heartbeat > 65000 || (epoch && p.epoch !== epoch)) throw fault('UNAVAILABLE');
 }
-export function operate(store, x, now = Date.now()) {
+export function operate(store, x, clock = Date.now) {
   const k = requestKey(x);
   return store.tx(s => {
+    const now = sample(clock); // identity, security and exclusive acquisition finished
     let r = s.external[k];
     if (r?.state === 'admitted' && !r.claim && now >= r.deadline) { r.state = 'failed'; r.evidence = 'deadline'; }
     if (x.op === 'status') {
@@ -68,10 +71,11 @@ function capacity(s) {
   const count = Object.keys(s.external).length;
   if (count > IDENTITIES || Buffer.byteLength(JSON.stringify([s.external,s.externalScans,s.externalScanNext])) + count * TRANSITION_BYTES > ADMISSION_BYTES) throw fault('CAPACITY');
 }
-export function claim(store, k, self, epoch, now) {
+export function claim(store, k, self, epoch, clock = Date.now) {
   return store.tx(s => {
     const r = s.external[k];
     if (!r || r.to !== self || r.claim || r.state !== 'admitted') return null;
+    const now = sample(clock);
     if (now >= r.deadline) { r.state = 'failed'; r.evidence = 'deadline'; return null; }
     try { capable(s.sessions[self], now, r.epoch); if (epoch !== r.epoch) throw fault('UNAVAILABLE'); }
     catch { r.state = 'failed'; r.evidence = 'owner_unavailable'; return null; }

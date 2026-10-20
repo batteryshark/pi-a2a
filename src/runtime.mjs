@@ -19,6 +19,8 @@ export class Runtime {
     this.spawnImpl = spawnImpl;
     this.transcript = transcript; this.inFlight = new Set(); this.observedReplies = new Set(); this.pendingWrites = new Map();
     this.epoch = id(); this.externalWrites = new Map();
+    this.turns = new Set(); this.cursors = {}; this.laneNext = 0; this.ocPending = new Set();
+    this.proofRequested = true;
   }
   start() {
     if (process.platform === 'win32' && this.transcript()) {
@@ -41,7 +43,7 @@ export class Runtime {
       }
     });
     this.watch();
-    this.sweep = setInterval(() => { this.watch(); this.schedule(); }, 30000); this.sweep.unref();
+    this.sweep = setInterval(() => { this.watch(); this.proofRequested = true; this.schedule(); }, 30000); this.sweep.unref();
     this.schedule();
     if (this.parent && this.create) {
       // Child-side watchdog survives loss/SIGKILL of its RPC process owner.
@@ -53,7 +55,7 @@ export class Runtime {
     // watches after directory recreation. No new polling service or effect retry.
     this.watcher?.close(); this.watcher = null;
     try {
-      this.watcher = fs.watch(this.store.root, () => this.schedule());
+      this.watcher = fs.watch(this.store.root, () => this.schedule(30, true));
       this.watcher.on('error', () => { this.watcher?.close(); this.watcher = null; this.schedule(); });
     } catch { this.schedule(); }
   }
@@ -63,9 +65,39 @@ export class Runtime {
     process.kill(pid, 'SIGTERM');
     setTimeout(() => process.kill(pid, 'SIGKILL'), 2000);
   }
-  schedule(delay = 30) {
-    if (this.closed || this.scheduled) return;
+  schedule(delay = 30, watchEvent = false) {
+    if (this.closed || this.lostOwner) return;
+    if (this.working) { if (!watchEvent) this.wakeRequested = true; return; }
+    if (this.scheduled) return;
     this.scheduled = setTimeout(() => { this.scheduled = null; this.reconcile().catch(() => {}); }, delay);
+  }
+  owner(s) {
+    const p = s.sessions[this.self];
+    return p?.pid === process.pid && p.epoch === this.epoch && p.online === true ? p : null;
+  }
+  ownedTx(fn) {
+    if (this.closed || this.lostOwner) throw Object.assign(Error('Runtime owner changed'), {code:'A2A_OWNER_LOST'});
+    let heartbeat;
+    const result = this.store.tx(s => {
+      const p = this.owner(s);
+      if (!p) { this.lostOwner = true; throw Object.assign(Error('Runtime owner changed'), {code:'A2A_OWNER_LOST'}); }
+      const now = this.now();
+      // Normal work proves only OUR exact live PID/epoch is active. Never set
+      // online or renew another peer (including from the companion).
+      if (now - p.heartbeat > 20000) p.heartbeat = now;
+      heartbeat = p.heartbeat;
+      return fn(s);
+    });
+    this.lastHeartbeat = heartbeat; // scheduling hint, NEVER an ownership/security cache
+    return result;
+  }
+  turn() {
+    if (this.closed || this.lostOwner) return Promise.resolve(false);
+    return new Promise(resolve => {
+      const entry = {resolve, timer:null};
+      entry.timer = setTimeout(() => { this.turns.delete(entry); resolve(!this.closed && !this.lostOwner); }, 0);
+      this.turns.add(entry);
+    });
   }
   async send(to, text, opts = {}) {
     let pinned;
@@ -76,7 +108,7 @@ export class Runtime {
     if (pinned) r.chiefDirectory = pinned.directory;
     if (target.kind === 'oc') r.ocOrigin = this.oc.url;
     let duplicate = false;
-    this.store.tx(s => {
+    this.ownedTx(s => {
       duplicate = !!s.requests[r.id];
       if (target.kind === 'pi') {
         const peer = s.sessions[to];
@@ -93,15 +125,23 @@ export class Runtime {
     const saved = this.store.read().requests[r.id];
     return { id: r.id, to, replyPending: r.expectReply, status: saved.status, ...(saved.reason ? { reason: saved.reason } : {}) };
   }
-  update(id, data) { this.store.tx(s => { Object.assign(s.requests[id], data); }); }
+  update(id, data) { this.ownedTx(s => { Object.assign(s.requests[id], data); }); }
   hookWrite(id, data) {
     // Only local, idempotent hook state is retried. Never replay an admission/effect.
     this.pendingWrites.set(id, { ...this.pendingWrites.get(id), ...data });
+    this.flushWrite(id);
+  }
+  flushWrite(id) {
     try {
-      this.store.tx(s => { const data = this.pendingWrites.get(id); if (!data.status || !terminal(s.requests[id])) Object.assign(s.requests[id], data); });
+      this.ownedTx(s => {
+        const data=this.pendingWrites.get(id), r=s.requests[id];
+        if (!data || !r || (data.status && terminal(r))) return;
+        if (data.status && terminal(data) && this.now()>=r.deadline) Object.assign(r,{status:'timeout',answer:'Request deadline expired; external work may still be running.'});
+        else Object.assign(r,data);
+      });
       this.pendingWrites.delete(id);
     }
-    catch (e) { if (e.code !== 'A2A_BUSY') throw e; }
+    catch (e) { if (e.code !== 'A2A_BUSY') throw e; this.busySeen=true; }
   }
   consumedReplies() {
     // Pi emits message_end BEFORE appending to its transcript. Read the actual
@@ -120,55 +160,139 @@ export class Runtime {
     const controller = new AbortController(); this.eventAbort = controller;
     this.oc.events(controller.signal, () => this.schedule()).catch(() => {}).finally(() => { if (this.eventAbort === controller) this.eventAbort = null; });
   }
-  async reconcile() {
-    if (this.working || this.closed) return;
-    this.working = true;
+  reconcile() {
+    if (this.closed || this.lostOwner) return Promise.resolve();
+    if (this.reconciling) return this.reconciling;
+    this.working = true; this.wakeRequested = false;
+    this.reconciling = this.reconcilePass().finally(() => {
+      this.working = false; this.reconciling = null;
+      if (this.moreWork || this.wakeRequested || this.pendingWrites.size || this.externalWrites.size ||
+          (this.active?.candidate && (this.active.candidateAttempts ?? 0) < 32)) this.schedule(250);
+    });
+    return this.reconciling;
+  }
+  rotated(lane, ids) {
+    const previous = ids.indexOf(this.cursors[lane]);
+    return previous < 0 ? ids : [...ids.slice(previous + 1), ...ids.slice(0, previous + 1)];
+  }
+  async reconcilePass() {
+    this.moreWork = false; this.busySeen = false;
     try {
-      this.reconcileExternal();
-      for (const [id, data] of this.pendingWrites) this.hookWrite(id, data);
-      this.completeCandidate();
-      let requests = Object.values(this.store.read().requests);
-      for (const r of requests) {
-        if ((r.from === this.self || r.to === this.self) && !terminal(r) && this.now() >= r.deadline) {
-          this.update(r.id, { status: 'timeout', answer: 'Request deadline expired; external work may still be running.' });
-          continue;
+      if (!await this.turn()) return;
+      const before = this.store.read();
+      if (!this.owner(before)) { this.lostOwner = true; return; }
+      this.lastHeartbeat = before.sessions[this.self].heartbeat;
+      if (!await this.turn()) return;
+      const requests = Object.values(before.requests);
+      const replies = requests.filter(r => r.from === this.self && r.expectReply && terminal(r) && !r.notified);
+      const consumed = replies.length ? this.consumedReplies() : new Set();
+      if (replies.length && !await this.turn()) return;
+      const queues = {
+        native:this.rotated('native', requests.filter(r => !terminal(r) && (r.from === this.self || r.to === this.self) &&
+          (this.now()>=r.deadline || (r.from===this.self && r.to.startsWith('oc/') && this.oc && r.ocOrigin===this.oc.url && !this.ocPending.has(r.id)))).map(r => r.id)),
+        replies:this.rotated('replies', replies.filter(r=>consumed.has(`${r.id}-reply`) || (!this.inFlight.has(r.id)&&!this.observedReplies.has(r.id))).map(r => r.id)),
+        external:this.rotated('external', Object.keys(before.external).filter(k => { const r=before.external[k]; return r.to===this.self && !r.claim && r.state==='admitted'; })),
+        dispatch:this.active ? [] : requests.filter(r => r.to===this.self && !terminal(r) && !r.injected).slice(0,1).map(r=>r.id)
+      };
+      const lanes = ['maintenance','pending','candidate','native','replies','dispatch','external'];
+      let maintained = false, candidateDone = false;
+      const pendingDone=new Set();
+      for (let budget=0; budget<8 && !this.closed && !this.lostOwner; budget++) {
+        if (this.busySeen) {this.moreWork=true;return;}
+        let action;
+        if (this.now()-this.lastHeartbeat>20000) action=()=>this.ownedTx(()=>{});
+        for (let tries=0; tries<lanes.length && !action; tries++) {
+          const lane=lanes[this.laneNext]; this.laneNext=(this.laneNext+1)%lanes.length;
+          if (lane==='maintenance') {
+            const peer=before.sessions[this.self];
+            const proofDue=this.proofRequested && this.now()-(this.lastExternalScan??0)>=1000 && Object.values(before.external).some(r=>r.to===this.self && r.claim && !r.proof);
+            if (this.externalWrites.size || (!maintained && (proofDue || this.now()-peer.heartbeat>20000))) {
+              action=()=>this.reconcileExternal(); maintained=true;
+            }
+          } else if (lane==='candidate') {
+            if (!candidateDone && this.active?.candidate) {candidateDone=true;action=()=>this.completeCandidate();}
+          } else {
+            const id=lane==='pending' ? this.rotated('pending',[...this.pendingWrites.keys()].filter(id=>!pendingDone.has(id)))[0] : queues[lane].shift();
+            if (id!==undefined) {
+              if (lane==='pending') pendingDone.add(id);
+              this.cursors[lane]=id;
+              action=()=>{
+                if (lane==='pending') this.flushWrite(id);
+                if (lane==='native') this.reconcileNative(id);
+                if (lane==='replies') this.deliverReply(id,consumed);
+                if (lane==='dispatch') this.dispatchNative(id);
+                if (lane==='external') this.dispatchExternal(id);
+              };
+            }
+          }
         }
-        if (r.from === this.self && r.to.startsWith('oc/') && !terminal(r) && this.oc && r.ocOrigin === this.oc.url) {
-          this.connectEvents();
-          try { const result = await this.oc.outcome(r); if (result) this.update(r.id, result); } catch { /* bounded reconciliation next event/sweep */ }
-        }
+        if (!action) break;
+        action();
+        if (this.busySeen) {this.moreWork=true;return;}
+        // A real timer turn, OUTSIDE Store.tx. Keep the working guard held.
+        if (!await this.turn()) return;
       }
-      if (this.closed) return;
-      requests = Object.values(this.store.read().requests);
-      const consumed = this.consumedReplies();
-      for (const r of requests) if (r.from === this.self && r.expectReply && terminal(r) && !r.notified) {
-        if (consumed.has(`${r.id}-reply`)) {
-          this.hookWrite(r.id, { notified: true }); this.inFlight.delete(r.id); continue;
-        }
-        // One enqueue per process lifetime; busy Pi queues are volatile. A new
-        // owner retries only if the stable ID is absent from its saved transcript.
-        if (this.inFlight.has(r.id) || this.observedReplies.has(r.id)) continue;
-        this.inFlight.add(r.id);
-        this.sendMessage({ customType: 'pi-a2a-reply', content: `[Untrusted a2a ${r.status} from ${r.to}; request ${r.id}]\n${r.answer ?? r.reason ?? '(No text)'}`,
-          display: true, details: { request: r.id, replyId: `${r.id}-reply`, status: r.status } }, { triggerTurn: true, deliverAs: 'followUp' });
-      }
-      if (!this.active) {
-        const r = requests.find(x => x.to === this.self && !terminal(x) && !x.injected);
-        if (r) {
-          this.update(r.id, { injected: true, status: 'queued' }); this.active = { ...r, seen: false, focus: false, assistantSeen: false, answer: '', outcome: 'completed' };
-          if (this.parent && this.create) this.requestLimit = setTimeout(() => {
-            try { this.update(r.id, { status: 'timeout', answer: 'Bounded Pi worker deadline expired' }); } finally { this.stopOwnWorker(); }
-          }, Math.max(1, r.deadline - this.now()));
-          this.sendMessage({ customType: 'pi-a2a-request', content: `[Untrusted a2a request ${r.id} from ${r.from}. Answer normally; automatic return is handled by pi-a2a. Do not send a second reply.]\n${r.text}`,
-            display: true, details: { request: r.id } }, { triggerTurn: true, deliverAs: r.delivery });
-        }
-      }
-    } finally {
-      this.working = false;
-      // fs.watch is advisory (including lock-release events). Retry only local
-      // idempotent writes, never admission or an injection claim/effect.
-      if (this.pendingWrites.size || (this.active?.candidate && (this.active.candidateAttempts ?? 0) < 32)) this.schedule(250);
+      const after=this.store.read();
+      if (!this.owner(after)) {this.lostOwner=true;return;}
+      this.moreWork=Object.values(after.external).some(r=>r.to===this.self&&!r.claim&&r.state==='admitted') ||
+        Object.values(after.requests).some(r=>
+          (!terminal(r)&&(r.from===this.self||r.to===this.self)&&this.now()>=r.deadline) ||
+          (r.from===this.self&&r.expectReply&&terminal(r)&&!r.notified&&!this.inFlight.has(r.id)&&!this.observedReplies.has(r.id)) ||
+          (!this.active&&r.to===this.self&&!terminal(r)&&!r.injected));
+    } catch(e) {
+      if (e.code==='A2A_BUSY') {this.moreWork=true;return;}
+      if (e.code==='A2A_OWNER_LOST') {this.lostOwner=true;return;}
+      throw e;
     }
+  }
+  reconcileNative(id) {
+    // Read-only network collection must not manufacture a write/watch loop.
+    // Never await the network promise while holding the reconciliation guard.
+    const snapshot=this.store.read();
+    if (!this.owner(snapshot)) {this.lostOwner=true;throw Object.assign(Error('Runtime owner changed'),{code:'A2A_OWNER_LOST'});}
+    const current=snapshot.requests[id];
+    if (!current || terminal(current)) return;
+    if (this.now()<current.deadline) {
+      if (!current.to.startsWith('oc/') || current.from!==this.self || !this.oc || current.ocOrigin!==this.oc.url || this.ocPending.has(id)) return;
+      this.collectOutcome(current); return;
+    }
+    // Timeout is one transaction in its own later unit, not read+write here.
+    this.pendingWrites.set(id,{status:'timeout',answer:'Request deadline expired; external work may still be running.'});
+    this.wakeRequested=true;
+  }
+  collectOutcome(r) {
+    const id=r.id;
+    this.connectEvents(); this.ocPending.add(id); const epoch=this.epoch;
+    Promise.resolve().then(()=>this.closed||this.lostOwner||this.epoch!==epoch ? null : this.oc.outcome(r)).then(result=>{
+      if (result && !this.closed && !this.lostOwner && this.epoch===epoch) {
+        this.pendingWrites.set(id,{...this.pendingWrites.get(id),...result});this.schedule();
+      }
+    },()=>{}).finally(()=>this.ocPending.delete(id));
+  }
+  deliverReply(id, consumed) {
+    const r=this.ownedTx(s=>{
+      const r=s.requests[id]; if (!r || r.from!==this.self || !r.expectReply || !terminal(r) || r.notified) return null;
+      if (consumed.has(`${id}-reply`)) {r.notified=true;this.inFlight.delete(id);return null;}
+      if (this.inFlight.has(id)||this.observedReplies.has(id)) return null;
+      return {...r};
+    });
+    if (!r) return;
+    this.inFlight.add(id);
+    Promise.resolve(this.sendMessage({customType:'pi-a2a-reply',content:`[Untrusted a2a ${r.status} from ${r.to}; request ${id}]\n${r.answer??r.reason??'(No text)'}`,display:true,details:{request:id,replyId:`${id}-reply`,status:r.status}},{triggerTurn:true,deliverAs:'followUp'})).catch(()=>{});
+  }
+  dispatchNative(id) {
+    if (this.active) return;
+    const r=this.ownedTx(s=>{
+      const r=s.requests[id]; if (!r || r.to!==this.self || terminal(r) || r.injected) return null;
+      if (this.now()>=r.deadline) {r.status='timeout';return null;}
+      r.injected=true;r.status='queued';return {...r};
+    });
+    if (!r) return;
+    this.active={...r,seen:false,focus:false,assistantSeen:false,answer:'',outcome:'completed'};
+    if (this.parent&&this.create) this.requestLimit=setTimeout(()=>{
+      try {this.update(id,{status:'timeout',answer:'Bounded Pi worker deadline expired'});} finally {this.stopOwnWorker();}
+    },Math.max(1,r.deadline-this.now()));
+    Promise.resolve(this.sendMessage({customType:'pi-a2a-request',content:`[Untrusted a2a request ${id} from ${r.from}. Answer normally; automatic return is handled by pi-a2a. Do not send a second reply.]\n${r.text}`,display:true,details:{request:id}},{triggerTurn:true,deliverAs:r.delivery})).catch(()=>{});
   }
   message(event) {
     const m = event.message;
@@ -227,10 +351,12 @@ export class Runtime {
     }
     if (!r?.candidate || r.candidateAttempts >= 32 || this.now() >= r.deadline) return;
     try {
-      this.store.tx(s => { if (!terminal(s.requests[r.id])) Object.assign(s.requests[r.id], r.candidate); });
+      const completed=this.ownedTx(s => { if (this.now()>=r.deadline && !terminal(s.requests[r.id])) return false; if (!terminal(s.requests[r.id])) Object.assign(s.requests[r.id], r.candidate); return true; });
+      if (!completed) return;
       this.pendingWrites.delete(r.id); this.active = null; clearTimeout(this.requestLimit);
     } catch (e) {
       if (e.code !== 'A2A_BUSY') throw e;
+      this.busySeen = true;
       r.candidateAttempts = (r.candidateAttempts ?? 0) + 1;
     }
   }
@@ -243,42 +369,42 @@ export class Runtime {
   }
   createWorker(opts) { return createWorker(this, opts); }
   reconcileExternal() {
-    // One transaction for local monotonic updates, proof, and heartbeat. Avoid a
-    // write-triggered watcher loop when nothing has changed.
-    const before = this.store.read(); const peer = before.sessions[this.self];
-    const pending = this.now() - (this.lastExternalScan ?? 0) >= 1000 && Object.values(before.external).some(r => r.to === this.self && r.claim && !r.proof);
-    if (this.externalWrites.size || pending || this.now() - (peer?.heartbeat ?? 0) > 20000) {
-      this.store.tx(s => {
-        const p = s.sessions[this.self]; if (p?.epoch !== this.epoch) return;
-        p.heartbeat = this.now();
-        for (const r of Object.values(s.external)) {
-          const update = this.externalWrites.get(r.internal); if (update && !r.proof) Object.assign(r, update);
-          if (r.to === this.self && r.claim && !r.proof && this.now() >= r.deadline) { r.state = 'uncertain'; r.uncertainty = true; }
-        }
-        reconcileProof(s, this.self);
-      });
-      this.externalWrites.clear();
-      this.lastExternalScan = this.now();
-    }
-    for (const [k, r] of Object.entries(before.external)) if (r.to === this.self && !r.claim && r.state === 'admitted') {
-      const taken = claim(this.store, k, this.self, this.epoch, this.now());
-      if (!taken) continue;
+    const batch=new Map(this.externalWrites);
+    this.ownedTx(s => {
+      const now=this.now();
+      for (const r of Object.values(s.external)) {
+        if (r.to!==this.self) continue;
+        // Claimed rows are compact: their original epoch is deliberately gone.
+        // The immutable internal/claim association and THIS collector's ownedTx
+        // guard, not discarded payload metadata, authorize monotonic local facts.
+        const update=batch.get(r.internal); if (update && r.claim && !r.proof) Object.assign(r,update);
+        if (r.claim && !r.proof && now>=r.deadline) {r.state='uncertain';r.uncertainty=true;}
+      }
+      reconcileProof(s,this.self);
+    });
+    for (const [id,value] of batch) if(this.externalWrites.get(id)===value) this.externalWrites.delete(id);
+    this.proofRequested=false; this.lastExternalScan=this.now();
+  }
+  dispatchExternal(k) {
+      const taken = claim({tx:fn=>this.ownedTx(fn)}, k, this.self, this.epoch, () => this.now());
+      if (!taken) return;
+      const epoch=this.epoch;
       // Claim is irreversible, including if the process dies before this call.
       try {
         const result = this.sendMessage({ customType: TYPE, content: content(taken), display: true,
           details: { internal: taken.internal, claim: taken.claim, digest: taken.digest } },
         { triggerTurn: true, deliverAs: taken.delivery === 'queue' ? 'followUp' : 'steer' });
         Promise.resolve(result).then(() => {
-          if (!this.closed) { this.externalWrites.set(taken.internal, { ...this.externalWrites.get(taken.internal), injected: true, state: 'injected' }); this.schedule(); }
+          if (!this.closed && !this.lostOwner && this.epoch===epoch) { this.proofRequested=true; this.externalWrites.set(taken.internal, { ...this.externalWrites.get(taken.internal), injected: true, state: 'injected' }); this.schedule(); }
         }, () => {
-          if (!this.closed) { this.externalWrites.set(taken.internal, { state: 'uncertain', uncertainty: true }); this.schedule(); }
+          if (!this.closed && !this.lostOwner && this.epoch===epoch) { this.proofRequested=true; this.externalWrites.set(taken.internal, { state: 'uncertain', uncertainty: true }); this.schedule(); }
         });
       } catch { this.externalWrites.set(taken.internal, { state: 'uncertain', uncertainty: true }); }
-    }
   }
   async close() {
     if (this.closed) return; this.closed = true;
     clearTimeout(this.scheduled); clearInterval(this.sweep); clearTimeout(this.hardLimit); clearTimeout(this.requestLimit); this.watcher?.close(); this.eventAbort?.abort();
+    for (const entry of this.turns) {clearTimeout(entry.timer);entry.resolve(false);} this.turns.clear();
     const waits = [];
     for (const child of this.children.values()) if (child.exitCode === null && child.pid) {
       waits.push(new Promise(resolve => {
@@ -288,6 +414,7 @@ export class Runtime {
       }));
     }
     await Promise.all(waits);
-    this.store.tx(s => { const self = s.sessions[this.self]; if (self?.pid === process.pid) self.online = false; });
+    await this.reconciling;
+    this.store.tx(s => { const self = s.sessions[this.self]; if (self?.pid === process.pid && self.epoch===this.epoch) self.online = false; });
   }
 }

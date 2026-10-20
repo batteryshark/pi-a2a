@@ -18,7 +18,7 @@ export async function createWorker(runtime, opts) {
   const args = workerArgs({ ...opts, extension: runtime.extension, transcript });
   const launch = piLaunch(args, { env:{...process.env, PI_A2A_PI_BIN:runtime.piBin} });
   // Reserve before spawning. An ambiguous/crashed create is never replayed.
-  runtime.store.tx(s => {
+  runtime.ownedTx(s => {
     if (Object.values(s.creates).filter(c => c.status === 'reserved' || (c.status === 'running' && live(c.pid))).length >= 2) throw Error('Two-worker limit reached');
     s.creates[token] = { owner: runtime.self, parent: runtime.self, nested: opts.nest !== false, status: 'reserved', transcript };
   });
@@ -44,7 +44,7 @@ export async function createWorker(runtime, opts) {
     child.once('exit', () => finish(Error('Pi worker exited before readiness')));
     child.on('spawn', () => {
       try {
-        runtime.store.tx(s => { Object.assign(s.creates[token], { status: 'running', pid: child.pid }); });
+        runtime.ownedTx(s => { Object.assign(s.creates[token], { status: 'running', pid: child.pid }); });
         child.stdin.write(JSON.stringify({ id: token, type: 'get_state' }) + '\n');
       } catch { finish(Error('Worker ownership admission failed; reconcile reserved create')); }
     });

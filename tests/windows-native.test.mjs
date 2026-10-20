@@ -77,13 +77,18 @@ test('native protected root, inherited payload, transaction lock/temp and restar
 });
 for(const mode of ['creation','evidence','reader']) test(`native explicit constructors/exclusivity and evidence roles: ${mode}`, {skip:!native,timeout:90000}, t=>{
   const root=fixtureRoot('native-create-');
+  let passed=false;
   try {
     const r=spawnSync(path.join(process.env.SystemRoot,'System32/WindowsPowerShell/v1.0/powershell.exe'),
       ['-NoLogo','-NoProfile','-NonInteractive','-File',fileURLToPath(new URL('./windows-create-native.ps1',import.meta.url)),root,mode],
       {encoding:'utf8',timeout:80000,shell:false});
-    if(mode==='evidence' && r.status===77) {t.skip('Token cannot construct an Administrators-owned synthetic evidence fixture; descriptor-policy coverage is separate');return;}
+    if(mode==='evidence' && r.status===77) {passed=true;t.skip('Token cannot construct an Administrators-owned synthetic evidence fixture; descriptor-policy coverage is separate');return;}
     assert.equal(r.status,0,r.stdout+r.stderr); assert.match(r.stdout,/native-fixtures passed/);
-  } finally {fs.rmSync(root,{recursive:true,force:true});}
+    passed=true;
+  } finally {
+    if(!passed&&process.env.PI_A2A_TEST_RETAIN_FAILURE==='1') console.error(`Retained owned native failure fixture: ${root}`);
+    else fs.rmSync(root,{recursive:true,force:true});
+  }
 });
 test('native actual ordinary-grant and junction negatives, trusted OS descriptor', {skip:!native,timeout:90000}, () => {
   const root=fixtureRoot('native-negative-');

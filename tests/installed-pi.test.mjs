@@ -7,6 +7,12 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 import { Runtime } from '../src/runtime.mjs';
 import { operate, requestKey } from '../src/external.mjs';
 import { fixtureRoot } from './fixture.mjs';
+import { setTimeout as timerTurn } from 'node:timers/promises';
+
+function cleanupFixture(dir, passed) {
+  if (!passed && process.env.PI_A2A_TEST_RETAIN_FAILURE === '1') console.error(`Retained owned installed-Pi failure fixture: ${dir}`);
+  else fs.rmSync(dir,{recursive:true,force:true});
+}
 
 // Optional host-contract regression; all IDs/messages are synthetic.
 // Point at an already installed Pi package, never a fixed release location.
@@ -23,6 +29,7 @@ test('installed Pi busy queue loss retries stable reply after restart; only save
   const make = (session, deliver = sendMessage) => new Runtime({ root: dir, session, cwd: dir,
     extension: fileURLToPath(new URL('../index.ts', import.meta.url)), sendMessage: deliver,
     transcript: () => manager.getSessionFile() });
+  let passed=false;
   let a = make('fake_sender'); const b = make('fake_receiver', () => {}); a.start(); b.start();
   try {
     const original = await a.send('pi/fake_receiver', 'synthetic task'); await b.reconcile();
@@ -43,7 +50,11 @@ test('installed Pi busy queue loss retries stable reply after restart; only save
     assert.equal(queue.length, 0);
     a.update(original.id, { notified: false }); await a.reconcile(); assert.equal(queue.length, 0);
     assert.equal(a.store.read().requests[original.id].notified, true);
-  } finally { await a.close(); await b.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+    passed=true;
+  } finally {
+    try {await a.close();await b.close();} catch(e) {passed=false;throw e;}
+    finally {cleanupFixture(dir,passed);}
+  }
 });
 
 test('genuine installed Pi agent loop/writer: external message_end precedes exact saved proof (synthetic stream, NO NETWORK)', { timeout:process.platform==='win32'?540000:20000 }, async () => {
@@ -60,7 +71,7 @@ test('genuine installed Pi agent loop/writer: external message_end precedes exac
   const dir=fixtureRoot('pi-a2a-real-loop-');
   const originalFetch=globalThis.fetch;
   globalThis.fetch=()=>{throw Error('NETWORK FORBIDDEN by installed proof fixture');};
-  let runtime, session;
+  let runtime, session, passed=false;
   try {
     const manager=SessionManager.create(dir,dir), settings=SettingsManager.inMemory({compaction:{enabled:false},retry:{enabled:false}});
     const loader=new DefaultResourceLoader({cwd:dir,agentDir:dir,settingsManager:settings,noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,noContextFiles:true});
@@ -87,13 +98,18 @@ test('genuine installed Pi agent loop/writer: external message_end precedes exac
         assert.ok(item); assert.equal(status(item).facts.consumed,false); beforeAppend++;
       }
     });
-    for(const item of cases) operate(runtime.store,item);
+    // Sender and owner are cohosted here. Model independently scheduled callers
+    // with REAL timer turns and completion of normal owner work, not a manual
+    // heartbeat or Promise.resolve/await of synchronous operate(). Not a native
+    // availability/throughput substitute for a separate-process target proof.
+    for(const item of cases) {operate(runtime.store,item);await timerTurn(0);await runtime.reconcile();}
     await runtime.reconcile(); await Promise.all(sends);
     assert.equal(beforeAppend,3); assert.ok(requests>=2);
     for(const item of cases) assert.equal(status(item).state,'consumed');
     assert.equal(status().facts.historicalUncertainty,true);
+    passed=true;
   } finally {
-    await runtime?.close(); session?.dispose(); globalThis.fetch=originalFetch;
-    fs.rmSync(dir,{recursive:true,force:true});
+    try {await runtime?.close();} catch(e) {passed=false;throw e;}
+    finally {session?.dispose();globalThis.fetch=originalFetch;cleanupFixture(dir,passed);}
   }
 });

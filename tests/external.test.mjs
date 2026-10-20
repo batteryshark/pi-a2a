@@ -241,7 +241,7 @@ async function race(dir, first, second) {
     await Promise.all([a.done,b.done]);
     for(let i=0;i<results.length;i++) if(results[i].error==='A2A_BUSY') {
       const job=[first,second][i];
-      try {results[i].value=job.action==='claim'?claim(new Store(dir),requestKey(job.x),'pi/target','race-epoch',Date.now()):operate(new Store(dir),job.x); delete results[i].error;}
+      try {results[i].value=job.action==='claim'?claim(new Store(dir),requestKey(job.x),'pi/target','race-epoch',Date.now):operate(new Store(dir),job.x); delete results[i].error;}
       catch(e) {results[i].error=e.code;}
     }
     return results;

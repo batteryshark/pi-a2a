@@ -6,8 +6,17 @@ $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $helper = Join-Path $PSScriptRoot '../src/windows-security.ps1'
 $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 function Call([string]$op,[string]$p,[int]$status=0) {
-  $out = @{op=$op;path=$p} | ConvertTo-Json -Compress | & $ps -NoLogo -NoProfile -NonInteractive -File $helper
-  if ($LASTEXITCODE -ne $status) { throw "helper result mismatch for $op (exit $LASTEXITCODE, expected $status)" }
+  $stderrFile = Join-Path $Root ('helper-stderr-' + [Guid]::NewGuid().ToString() + '.txt')
+  $out = @(); $invocationError = $null
+  try { $out = @{op=$op;path=$p} | ConvertTo-Json -Compress | & $ps -NoLogo -NoProfile -NonInteractive -File $helper 2> $stderrFile }
+  catch { $invocationError = $_.Exception.Message }
+  $actual = $LASTEXITCODE
+  if ($actual -ne $status -or $null -ne $invocationError) {
+    $stderr = ''; if (Test-Path -LiteralPath $stderrFile) { $stderr = [IO.File]::ReadAllText($stderrFile) }
+    $diagnostic = @{op=$op;expected=$status;actual=$actual;stdout=($out -join "`n");stderr=$stderr;invocationError=$invocationError} | ConvertTo-Json -Compress
+    throw "helper result mismatch: $diagnostic"
+  }
+  [IO.File]::Delete($stderrFile)
   return ($out | ConvertFrom-Json)
 }
 [void](Call 'verifyRoot' $Root)
