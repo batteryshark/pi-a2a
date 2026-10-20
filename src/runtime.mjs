@@ -5,6 +5,8 @@ import { OpenCode, chiefTarget } from './opencode.mjs';
 import { createWorker } from './worker.mjs';
 import { id } from './store.mjs';
 import { claim, content, TYPE, reconcileProof } from './external.mjs';
+import path from 'node:path';
+import { securePath } from './platform.mjs';
 
 export class Runtime {
   constructor({ root, session, cwd, sendMessage, extension, piBin = process.env.PI_A2A_PI_BIN ?? 'pi', oc, parent = process.env.PI_A2A_PARENT,
@@ -19,6 +21,11 @@ export class Runtime {
     this.epoch = id(); this.externalWrites = new Map();
   }
   start() {
+    if (process.platform === 'win32' && this.transcript()) {
+      const file = this.transcript();
+      securePath(path.dirname(file), true);
+      if (fs.existsSync(file)) securePath(file);
+    }
     this.store.tx(s => {
       const old = s.sessions[this.self];
       if (old?.online && live(old.pid)) throw Error('Transcript already owned by another Pi process');
@@ -33,14 +40,22 @@ export class Runtime {
         r.state = 'uncertain'; r.uncertainty = true;
       }
     });
-    this.watcher = fs.watch(this.store.root, (_event, name) => { if (name === 'state.json' || name === 'transaction.lock') this.schedule(); });
-    this.watcher.on('error', () => { this.watcher?.close(); });
-    this.sweep = setInterval(() => this.schedule(), 30000); this.sweep.unref();
+    this.watch();
+    this.sweep = setInterval(() => { this.watch(); this.schedule(); }, 30000); this.sweep.unref();
     this.schedule();
     if (this.parent && this.create) {
       // Child-side watchdog survives loss/SIGKILL of its RPC process owner.
       this.hardLimit = setTimeout(() => this.stopOwnWorker(), 600000);
     }
+  }
+  watch() {
+    // Reattach on each bounded existing sweep, including silently invalidated
+    // watches after directory recreation. No new polling service or effect retry.
+    this.watcher?.close(); this.watcher = null;
+    try {
+      this.watcher = fs.watch(this.store.root, () => this.schedule());
+      this.watcher.on('error', () => { this.watcher?.close(); this.watcher = null; this.schedule(); });
+    } catch { this.schedule(); }
   }
   stopOwnWorker() {
     if (!this.parent || !this.create) return;
@@ -93,6 +108,7 @@ export class Runtime {
     // file on reconciliation, not the facade return or in-memory session tree.
     const file = this.transcript();
     if (!file || !fs.existsSync(file) || fs.statSync(file).size > 16 * 1024 * 1024) return new Set();
+    if (process.platform === 'win32') { try { securePath(file); } catch { return new Set(); } }
     const ids = new Set();
     for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
       try { const e = JSON.parse(line); if (e.type === 'custom_message' && e.customType === 'pi-a2a-reply') ids.add(e.details?.replyId); } catch { /* partial final append is not an ack */ }

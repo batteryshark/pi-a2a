@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { accountIdentity } from './platform.mjs';
+import { accountIdentity, securePath, windowsHelper, windowsPath } from './platform.mjs';
 
 export const id = () => crypto.randomUUID();
 export const live = pid => { if (!Number.isSafeInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
@@ -9,24 +9,40 @@ export function key(s) {
   if (typeof s !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(s)) throw Error('Invalid bounded ID');
   return s;
 }
-function secure(p, dir = false) {
-  const s = fs.lstatSync(p);
-  if (s.isSymbolicLink() || (dir ? !s.isDirectory() : !s.isFile()) || s.uid !== process.getuid() || (s.mode & 0o077)) throw Error('State must be owner-only, regular, and not symlinked');
+const empty = () => ({ v:2, sessions:{}, requests:{}, creates:{}, external:{} });
+export function retryIO(fn, { platform = process.platform, wait = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms) } = {}) {
+  for (let n = 0; ; n++) try { return fn(); } catch (e) {
+    if (platform !== 'win32' || !['EPERM','EACCES','EBUSY'].includes(e.code) || n === 3) throw e;
+    wait(10 * (n + 1));
+  }
 }
 export class Store {
-  constructor(root) {
+  constructor(root, { readOnly = false } = {}) {
     accountIdentity();
     if (!path.isAbsolute(root)) throw Error('Absolute state root required');
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    secure(root, true);
-    if (fs.realpathSync(root) !== path.resolve(root)) throw Error('Symlinked state path refused');
+    this.readOnly = readOnly;
+    if (process.platform === 'win32') {
+      windowsPath(root);
+      windowsHelper(readOnly ? 'inspectRoot' : 'root', root);
+    } else {
+      if (!readOnly) fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+      if (fs.existsSync(root)) {
+        securePath(root, true);
+        if (fs.realpathSync(root) !== path.resolve(root)) throw Error('Symlinked state path refused');
+      } else {
+        let p = path.dirname(root); while (!fs.existsSync(p)) p = path.dirname(p);
+        if (fs.realpathSync(p) !== p) throw Error('Symlinked state path refused');
+      }
+    }
     this.root = root;
     this.file = path.join(root, 'state.json');
     this.lock = path.join(root, 'transaction.lock');
   }
   read() {
-    if (!fs.existsSync(this.file)) return { v: 2, sessions: {}, requests: {}, creates: {}, external: {} };
-    secure(this.file);
+    if (!fs.existsSync(this.root)) return empty();
+    if (process.platform === 'win32') windowsHelper('verifyRoot', this.root); else securePath(this.root, true);
+    if (!fs.existsSync(this.file)) return empty();
+    securePath(this.file);
     const fd = fs.openSync(this.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     try {
       if (fs.fstatSync(fd).size > 16 * 1024 * 1024) throw Error('State size limit reached');
@@ -36,33 +52,48 @@ export class Store {
     } finally { fs.closeSync(fd); }
   }
   tx(fn) {
+    if (this.readOnly) throw Error('Read-only inspection');
+    if (process.platform === 'win32') windowsHelper('verifyRoot', this.root); else securePath(this.root, true);
     // No waiting/polling. A contended short transaction fails for caller retry.
     try { fs.mkdirSync(this.lock, { mode: 0o700 }); }
     catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      secure(this.lock, true);
+      securePath(this.lock, true);
       let owner;
-      try { owner = JSON.parse(fs.readFileSync(path.join(this.lock, 'owner'), 'utf8')); } catch { throw Error('State lock incomplete; manual reconciliation required'); }
+      try { securePath(path.join(this.lock, 'owner')); if (fs.statSync(path.join(this.lock, 'owner')).size > 1024) throw Error('owner limit'); owner = JSON.parse(fs.readFileSync(path.join(this.lock, 'owner'), 'utf8')); } catch { throw Error('State lock incomplete; manual reconciliation required'); }
+      if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) throw Error('State lock owner unknown; manual reconciliation required');
       if (live(owner.pid)) throw Object.assign(Error('State transaction busy'), { code: 'A2A_BUSY' });
       throw Error('Stale state lock: stop owners and reconcile lock manually; admission is not replayed');
     }
     const owner = path.join(this.lock, 'owner');
     const tmp = path.join(this.root, `${id()}.tmp`);
+    let committed = false, failure, result;
     try {
-      fs.writeFileSync(owner, JSON.stringify({ pid: process.pid }), { mode: 0o600, flag: 'wx' });
-      const s = this.read(); const result = fn(s);
+      securePath(this.lock, true);
+      const ownerFd = fs.openSync(owner, 'wx', 0o600);
+      try { securePath(owner); fs.writeFileSync(ownerFd, JSON.stringify({ pid: process.pid })); } finally { fs.closeSync(ownerFd); }
+      const s = this.read(); result = fn(s);
       // Keep native growth from consuming the external transition reserve.
       if (Buffer.byteLength(JSON.stringify({ sessions:s.sessions, requests:s.requests, creates:s.creates })) > 8 * 1024 * 1024) throw Error('Native state capacity reached');
       const body = JSON.stringify(s);
       if (Buffer.byteLength(body) > 16 * 1024 * 1024) throw Error('State size limit reached; retained identities must not be evicted');
       const fd = fs.openSync(tmp, 'wx', 0o600);
-      try { fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-      fs.renameSync(tmp, this.file);
-      const d = fs.openSync(this.root, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
-      return result;
-    } finally {
-      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-      if (fs.existsSync(owner)) fs.unlinkSync(owner); fs.rmdirSync(this.lock);
+      try { securePath(tmp); fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      if (fs.existsSync(this.file)) securePath(this.file);
+      retryIO(() => fs.renameSync(tmp, this.file)); committed = true;
+      // Windows has no supported Node directory-fsync contract. File is flushed
+      // before replacement; power-loss durability of directory metadata is unknown.
+      if (process.platform !== 'win32') { const d = fs.openSync(this.root, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } }
+    } catch (e) { failure = e; }
+    try {
+      if (fs.existsSync(tmp)) retryIO(() => fs.unlinkSync(tmp));
+      if (fs.existsSync(owner)) retryIO(() => fs.unlinkSync(owner));
+      retryIO(() => fs.rmdirSync(this.lock));
+    } catch (e) { failure ??= e; }
+    if (failure) {
+      if (committed) throw Object.assign(Error('State commit or cleanup uncertain; inspect same identity'), { code:'STORAGE_UNCERTAIN' });
+      throw failure;
     }
+    return result;
   }
 }

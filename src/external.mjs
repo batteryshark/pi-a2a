@@ -1,9 +1,18 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { live, id } from './store.mjs';
-import { accountIdentity } from './platform.mjs';
+import { accountIdentity, securePath } from './platform.mjs';
 
 export const TYPE = 'pi-a2a-external-v1';
+export const capabilities = () => ({ protocol:1, contract:'pi-a2a-external-v1', operations:['capabilities','lookup','send','status','cancel'],
+  delivery:['queue','steer'], expectReply:false, maxCaller:48, maxRequestId:96, maxTextBytes:32768, maxInputBytes:262144, maxOutputBytes:8192,
+  inspection:'read_only', targetSnapshot:true, reservation:false });
+export function lookup(store, to, now = Date.now()) {
+  const p = store.read().sessions[to];
+  const capable = !!(p?.externalV1 === true && p.persistence === true && typeof p.epoch === 'string');
+  return { to, exists:!!p, live:!!(p?.online && live(p.pid) && Number.isFinite(p.heartbeat) && p.heartbeat <= now + 1000 && now - p.heartbeat <= 65000),
+    capable, snapshot:true, reservation:false };
+}
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 export const fault = code => Object.assign(Error(code), { code });
 export const requestKey = x => hash(JSON.stringify(['pi-a2a/external/key/v1', accountIdentity(), x.caller, x.id]));
@@ -76,7 +85,7 @@ export function reconcileProof(s, to) {
     try {
       if (!file) { evidence('missing'); continue; }
       const st = fs.lstatSync(file);
-      if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || st.uid !== process.getuid()) { evidence('unsafe'); continue; }
+      try { securePath(file, false, { transcript:true }); } catch { evidence('unsafe'); continue; }
       fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       const stat = fs.fstatSync(fd);
       if (stat.ino !== st.ino || stat.dev !== st.dev) { evidence('changed'); continue; }

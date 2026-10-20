@@ -4,15 +4,25 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { piLaunch } from '../src/launch.mjs';
+import { Store } from '../src/store.mjs';
 
 const base = fileURLToPath(new URL('../', import.meta.url));
-const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pi-a2a-probe-')));
+let temp;
+if (process.platform === 'win32') {
+  // Never assume the OS Temp ACL is private. This explicit, disposable leaf
+  // must not already exist; Store supplies its protected DACL before any data.
+  temp = process.env.PI_A2A_PROBE_ROOT;
+  if (!temp || fs.existsSync(temp)) throw Error('Set a fresh absolute PI_A2A_PROBE_ROOT');
+  new Store(temp);
+} else temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pi-a2a-probe-')));
 const stateRoot = path.join(temp, 'mailbox');
 // An isolated working directory and agent directory avoid loading user packages.
 const env = { ...process.env, PI_CODING_AGENT_DIR: path.join(temp, 'agent'), PI_A2A_STATE: stateRoot, PI_TELEMETRY: '0' };
 for (const name of ['PI_A2A_OC_URL', 'PI_A2A_PARENT', 'PI_A2A_CREATE', 'PI_A2A_NESTED']) delete env[name];
-const child = spawn(process.env.PI_A2A_PI_BIN ?? 'pi', ['--mode', 'rpc', '--offline', '--no-session', '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--tools', 'a2a_list,a2a_read,a2a_send,a2a_create', '-e', base, '-e', path.join(base, 'tests/probe-extension.ts')],
-  { cwd: temp, env, stdio: ['pipe', 'pipe', 'pipe'] });
+const launch = piLaunch(['--mode', 'rpc', '--offline', '--no-session', '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-themes', '--tools', 'a2a_list,a2a_read,a2a_send,a2a_create', '-e', base, '-e', path.join(base, 'tests/probe-extension.ts')]);
+const child = spawn(launch.file, launch.args,
+  { shell:false, windowsHide:true, cwd: temp, env, stdio: ['pipe', 'pipe', 'pipe'] });
 let ended = false;
 const pending = new Map();
 const exited = new Promise(resolve => {

@@ -1,4 +1,4 @@
-import { operate, fault } from './external.mjs';
+import { operate, fault, capabilities, lookup } from './external.mjs';
 
 // Flat scalar JSON grammar deliberately excludes nested values. JSON.parse alone
 // cannot reject duplicate members, malformed UTF-8, or escaped lone surrogates.
@@ -20,7 +20,10 @@ export function parse(bytes) {
     ws(); if (text[i] !== ',') break; i++; ws();
   }
   if (text[i++] !== '}') throw fault('INVALID_JSON'); ws(); if (i !== text.length) throw fault('INVALID_JSON');
-  const fields = x.op === 'send' ? ['v','op','caller','id','to','text','delivery','expectReply'] : ['v','op','caller','id'];
+  const fields = x.op === 'capabilities' ? ['v','op'] : x.op === 'lookup' ? ['v','op','to'] : x.op === 'send' ? ['v','op','caller','id','to','text','delivery','expectReply'] : ['v','op','caller','id'];
+  if (Object.keys(x).length !== fields.length || fields.some(k => !Object.hasOwn(x,k)) || x.v !== 1) throw fault('SCHEMA');
+  if (x.op === 'capabilities') return x;
+  if (x.op === 'lookup') { if (typeof x.to !== 'string' || !/^pi\/[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(x.to)) throw fault('SCHEMA'); return x; }
   if (Object.keys(x).length !== fields.length || fields.some(k => !Object.hasOwn(x,k)) || Object.keys(x).some(k => !fields.includes(k)) ||
     x.v !== 1 || !['send','status','cancel'].includes(x.op) || typeof x.caller !== 'string' || !/^[a-z][a-z0-9-]{0,47}$/.test(x.caller) ||
     typeof x.id !== 'string' || !/^[A-Za-z0-9._:-]{1,96}$/.test(x.id)) throw fault('SCHEMA');
@@ -42,7 +45,12 @@ export const exits = { INVALID_JSON:2, SCHEMA:2, INPUT_LIMIT:2, INPUT_TIMEOUT:2,
   UNKNOWN:3, CONFLICT:4, CANCELLED:4, TOO_LATE:4, A2A_BUSY:5, STORAGE_UNCERTAIN:6 };
 export async function machine(createStore) {
   let result, exit = 0;
-  try { const x = parse(await input(process.stdin)); const store = createStore(); result = { v:1, ok:true, receipt:operate(store,x) }; }
+  try {
+    const x = parse(await input(process.stdin));
+    if (x.op === 'capabilities') result = { v:1, ok:true, capabilities:capabilities() };
+    else if (x.op === 'lookup') result = { v:1, ok:true, target:lookup(createStore({readOnly:true}),x.to) };
+    else result = { v:1, ok:true, receipt:operate(createStore(),x) };
+  }
   catch (e) { const code = Object.hasOwn(exits, e.code) ? e.code : 'STORAGE_UNCERTAIN'; exit = exits[code]; result = { v:1, ok:false, error:code, retry:'same_key_only' }; }
   const out = JSON.stringify(result); process.stdout.write(out.length <= 8191 ? out + '\n' : '{"v":1,"ok":false,"error":"STORAGE_UNCERTAIN"}\n'); process.exitCode = exit;
 }

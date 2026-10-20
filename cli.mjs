@@ -8,7 +8,7 @@ import { machine } from './src/machine.mjs';
 const [command, to, body] = process.argv.slice(2);
 if (command === 'machine') {
   if (process.argv.length !== 3) { console.log('{"v":1,"ok":false,"error":"SCHEMA","retry":"same_key_only"}'); process.exitCode = 2; }
-  else await machine(() => new Store(process.env.PI_A2A_STATE ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '.state-v2')));
+  else await machine(options => new Store(process.env.PI_A2A_STATE ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '.state-v2'), options));
 } else {
 try {
   const store = new Store(process.env.PI_A2A_STATE ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '.state-v2'));

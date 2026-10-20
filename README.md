@@ -17,9 +17,11 @@ is a 320×320 alpha-aware resampled derivative, not a separately designed tiny i
 
 ## Requirements and setup
 
-Use **Pi 1.0.4** and **Node 22.19.0+** on a POSIX host. Other Pi versions need
-verification. Native Windows is explicitly refused with `UNSUPPORTED_SECURITY` until verified native
-account/ACL support is implemented. Workers require `pi` on PATH (or `PI_A2A_PI_BIN`)
+Use **Pi 1.0.4** and **Node 22.19.0+**. Other Pi versions need
+verification. Native Windows storage/launch is a **candidate, unproven until
+native proof**; portable mocks do not establish Windows acceptance. Unsupported
+security configurations fail closed with `UNSUPPORTED_SECURITY`.
+POSIX workers require `pi` on PATH (or `PI_A2A_PI_BIN`)
 and existing authorized Pi model configuration. `--offline` disables startup
 network discovery; it does not make model requests offline or sandbox code.
 
@@ -63,7 +65,8 @@ in the optional probe below.
 
 Every participating Pi process and the CLI must use **the same absolute,
 canonical, non-symlinked `PI_A2A_STATE` directory**. It must be owner-only
-(0700); state files are 0600. Choose a private location outside the checkout:
+(0700) on POSIX; state files are 0600. Windows uses the ACL policy below, not
+chmod/mode bits. Choose a private location outside the checkout:
 
 ```sh
 # Fictional path: provision a private directory appropriate for your account.
@@ -212,12 +215,49 @@ Exit 0 means the operation was answered, **not delivery or task success**.
 | 5 | `A2A_BUSY` (retry same caller/id) |
 | 6 | `STORAGE_UNCERTAIN` (potentially committed; look up same caller/id) |
 
-Caller namespace derives from the trusted POSIX account and application label;
+Caller namespace derives from the trusted POSIX UID or internally verified
+Windows SID and application label;
 the label is not executable authentication. A domain-separated key identifies
 caller/id, and a canonical digest pins to/text/delivery/expectReply. Identical
 send returns the retained receipt **before** target liveness checks, even offline;
 any immutable change conflicts. Different caller labels are independent.
 Unknown status is `UNKNOWN`, not a cancellation barrier.
+
+### Pure inspection v1 (freeze before creating a reminder)
+
+Two additional strict stdin frames use the same command, input/output bounds,
+fixed error envelope and exits. No caller/id is needed or accepted:
+
+```json
+{"v":1,"op":"capabilities"}
+```
+```json
+{"v":1,"op":"lookup","to":"pi/fake_receiver"}
+```
+
+Capabilities returns `{v:1,ok:true,capabilities:{protocol:1,
+contract:"pi-a2a-external-v1",operations:["capabilities","lookup","send","status","cancel"],
+delivery:["queue","steer"],expectReply:false,maxCaller:48,maxRequestId:96,
+maxTextBytes:32768,maxInputBytes:262144,maxOutputBytes:8192,
+inspection:"read_only",targetSnapshot:true,reservation:false}}`.
+It is a static supported contract: **no filesystem access or store creation**.
+Caller `docket-<32 lowercase hex>` and request `msg_<32 hex>` fit the bounds.
+
+Lookup returns `{v:1,ok:true,target:{to:"pi/fake_receiver",exists:false,
+live:false,capable:false,snapshot:true,reservation:false}}` (booleans vary).
+It verifies an existing root/state read-only and never creates a missing root,
+locks, requests, claims, admissions or heartbeats; existing bytes are unchanged.
+Absent target/root returns `exists:false`. Schema-v1 state fails closed without
+upgrade. `capable` means external-v1 + persistence + owner epoch are advertised;
+old owners return false. `live` independently means online, a valid positive
+PID not known dead, and a heartbeat within 65 seconds (at most 1 second future
+skew). Unknown process liveness is conservative, **not proof of ownership**.
+Offline capable owners can return `capable:true,live:false`. Busy/idle,
+directory, transcript paths and payloads are deliberately omitted.
+
+This is a **non-reserving snapshot**, not a liveness/delivery guarantee. Admission
+and claim still validate capability/liveness/epoch inside their transactions.
+Docket uses only this public companion, never the mailbox or source internals.
 
 Current `state` is `admitted`, `injected`, `consumed`, `cancelled`, `uncertain`, or
 `failed`. (`pending` is reserved; not currently emitted.) Facts are monotonic:
@@ -297,7 +337,7 @@ resumed before a new send can be admitted.
 This section describes the **native tool/reply** lifecycle. Machine external
 wakes instead use the stricter, no-automatic-replay contract above.
 
-Admission is persisted by atomic rename and fsync before injection, spawning
+Admission is persisted by file flush and rename (plus directory fsync on POSIX) before injection, spawning
 or HTTP submission. Delivery is **at-least-once with admission deduplication**,
 not exactly-once execution or reply injection. Busy Pi follow-up queues are
 volatile: `sendMessage` returning isn't consumption. Stable reply IDs are
@@ -353,6 +393,85 @@ Keep the endpoint restricted, use only trusted recipients, and consider model
 cost and confidentiality. Runtime state contains sensitive messages and paths;
 never commit or publish it, credentials, pointers or real session transcripts.
 
+### Native Windows candidate security and launch policy
+
+Initial scope: **local fixed NTFS**, current-user-owned storage, Windows
+PowerShell **5.1**/.NET Framework and Node **22.19.0+**. No WSL, UNC/network,
+device/extended paths, ADS, drive-relative paths, dot components, trailing dots/
+spaces, reserved device names, reparse ancestors/targets or payload hardlinks.
+Fully qualified drive paths are checked case-insensitively by the native helper.
+Paths are bounded to 240 characters. Unsupported volume/ACL/helper failures are
+fixed errors, not a fallback to POSIX permissions. Same-user code and privileged
+SYSTEM/Administrators remain inside the OS trust boundary.
+
+`src/windows-security.ps1` derives the current SID internally. It is a fixed
+trusted package script launched with absolute system PowerShell, `-NoProfile
+-NonInteractive -File`, JSON stdin, no generated code or private values in argv,
+10-second timeout and 8 KiB output bound. `SystemRoot` is trusted launcher
+environment identifying the genuine Windows installation; do not override it.
+No installs, execution-policy changes, ACL repairs or permission widening occur.
+
+The immediate parent must exist. A **new dedicated leaf** is created with
+`DirectorySecurity` passed to `Directory.CreateDirectory(path, security)`:
+current user owner, protected DACL, inheritable user FullControl, before payload.
+Existing roots must already meet that policy; they are never silently repaired.
+SYSTEM/Administrators grants are allowed, other grants refused. Null/empty DACL,
+unknown/object/callback ACEs, payload deny ACEs, absent user FullControl,
+unprotected root, reparse points and wrong owner fail closed. New files/lock/
+temporary state and worker transcripts inherit only from verified directories;
+files are verified before payload write, and existing files/transcripts checked.
+Directory FullControl must be inheritable by both files and directories.
+
+Ancestors must be owned by the user/SYSTEM/Administrators, non-reparse, and must
+not grant ordinary principals delete/delete-child, ACL/owner change or write
+attributes/extended attributes. Ordinary ancestor read/traverse and create-sibling
+rights are not treated as access to the protected leaf. Launch files additionally
+reject ordinary write/append grants. An existing unsafe Temp is **not private**:
+select a fresh protected leaf under a verified ancestor, never repair Temp or
+an existing user's directories. External transcript locations must also pass
+security checks; worker transcripts live beneath the protected store.
+
+Transactions flush the temporary file once, then replace by rename. Windows
+does **not** claim POSIX directory fsync or power-loss durability of directory
+metadata. Only sharing/EPERM/EACCES/EBUSY replacement/cleanup errors receive at
+most three retries (10/20/30 ms); the transaction callback is never rerun.
+Post-rename flush/cleanup failure is `STORAGE_UNCERTAIN`, never definite rejection.
+Lock owner creation is cleanup-protected. Invalid/missing PID, liveness unknown,
+stale or incomplete locks are never stolen. Watch errors/missing/coalesced names
+schedule reconciliation; the existing 30-second sweep reattaches watches after
+invalidation/recreation. It never reconstructs lost state or replays claims.
+
+Windows workers and the optional probe use the **current native `process.execPath`
+Node executable** and a separate absolute Pi JavaScript entry argument, never
+`pi.cmd`, `shell:true`, or shell quoting. Version is checked before spawn. The
+current Pi host's `process.argv[1]` is validated against its package's `bin.pi`
+metadata (`@earendil-works/pi-coding-agent`). Alternatively set trusted
+`PI_A2A_PI_ENTRY` to a reviewed absolute installed JS entry (also metadata/ACL
+checked). `PI_A2A_PI_BIN` is POSIX-only. Node/entry/package metadata must be on
+supported paths with secure ancestors, no reparse points or hardlinks. This
+checks installed metadata; it does not attest package provenance/version.
+
+For the next native proof worker, first discover/verify the installed Pi JS
+entry/package and execute the supported native Node, **not an older PATH Node**.
+Using PowerShell, with fictional reviewed paths replaced:
+
+```powershell
+$env:PI_A2A_STATE = 'C:\PrivateLeaf\fresh-mailbox'
+$env:PI_A2A_PI_ENTRY = 'C:\ReviewedPi\dist\cli.js'
+& 'C:\SupportedNode\node.exe' .\cli.mjs machine # send one JSON stdin frame, EOF
+$env:PI_A2A_PROBE_ROOT = 'C:\PrivateLeaf\fresh-disposable-probe'
+& 'C:\SupportedNode\node.exe' .\tests\load-probe.mjs
+```
+
+For the probe, `PI_A2A_PROBE_ROOT` is mandatory on Windows and must be absent;
+it is protected before any fixture payload, and only that owned disposable leaf
+is removed afterward. The mailbox leaf's parent must also already exist and
+pass checks. The CLI alone is not launch proof: prove actual native worker RPC,
+ACL inheritance for files/temp/lock/transcripts, controlled unsafe/reparse/hardlink
+negatives, sharing/rename/watch/restart behavior and exact saved Pi intake.
+No native acceptance is claimed here; installed-shim/version discovery and
+these runtime checks remain the next lane.
+
 ## Tests and limits
 
 From the source root, with Node 22.19.0+, no install is required:
@@ -364,6 +483,10 @@ npm test
 The portable suite uses temporary canonical state roots, synthetic messages,
 fake HTTP/event and RPC boundaries, injected lifecycle callbacks, and a short
 owned Node process for real lock contention. No model/auth calls are made.
+Windows path/account/helper/launcher checks in this suite are clearly labeled
+portable mocks or source-policy assertions: they do not execute PowerShell or
+prove native ACLs. Native fixture provisioning must use dedicated protected
+leaves, not the portable suite's POSIX temporary-root helpers.
 
 Optional installed-Pi checks are separate from `npm test`. Point the package
 variable at your already installed **Pi 1.0.4 package directory**, not its
@@ -395,7 +518,8 @@ Source map: `index.ts` registers tools/hooks; `src/runtime.mjs` handles mailbox
 delivery and settlement; `store.mjs` owns transactions; `protocol.mjs` owns
 envelopes and correlation; `opencode.mjs` owns HTTP/SSE; `worker.mjs` owns RPC
 workers; `external.mjs` owns external claims/receipts/proof; `machine.mjs` owns
-strict stdin parsing; `platform.mjs` is the account/security seam;
+strict stdin parsing; `platform.mjs` and `windows-security.ps1` implement the
+account/security seam; `launch.mjs` validates native Node/Pi JS launch;
 `cli.mjs` is the trusted local companion. Bug reports should use a
 minimal synthetic reproduction and host versions, never private state.
 

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { id, live } from './store.mjs';
+import { piLaunch } from './launch.mjs';
 export const workerTools = ['read', 'grep', 'find', 'ls', 'a2a_list', 'a2a_read', 'a2a_send'];
 export function workerArgs({ model, directory, extension, transcript, tools }) {
   if (!/^(openai|openai-codex|google|google-gemini-cli)\/[A-Za-z0-9._:/-]+$/.test(model ?? '')) throw Error('Explicit allowed OpenAI/Gemini provider/model required');
@@ -15,12 +16,13 @@ export async function createWorker(runtime, opts) {
   if (runtime.parent) throw Error('Workers cannot create more workers');
   const token = id(); const transcript = path.join(runtime.store.root, `${token}.jsonl`);
   const args = workerArgs({ ...opts, extension: runtime.extension, transcript });
+  const launch = piLaunch(args, { env:{...process.env, PI_A2A_PI_BIN:runtime.piBin} });
   // Reserve before spawning. An ambiguous/crashed create is never replayed.
   runtime.store.tx(s => {
     if (Object.values(s.creates).filter(c => c.status === 'reserved' || (c.status === 'running' && live(c.pid))).length >= 2) throw Error('Two-worker limit reached');
     s.creates[token] = { owner: runtime.self, parent: runtime.self, nested: opts.nest !== false, status: 'reserved', transcript };
   });
-  const child = (runtime.spawnImpl ?? spawn)(runtime.piBin, args, { cwd: opts.directory, env: { ...process.env, PI_A2A_STATE: runtime.store.root, PI_A2A_PARENT: runtime.self,
+  const child = (runtime.spawnImpl ?? spawn)(launch.file, launch.args, { shell:false, windowsHide:true, cwd: opts.directory, env: { ...process.env, PI_A2A_STATE: runtime.store.root, PI_A2A_PARENT: runtime.self,
     PI_A2A_CREATE: token, PI_A2A_NESTED: opts.nest === false ? '0' : '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
   runtime.children.set(token, child);
   let force, requestTimer;
