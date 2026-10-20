@@ -4,7 +4,7 @@ import { address, envelope, admit, terminal, assistantText, clip } from './proto
 import { OpenCode, chiefTarget } from './opencode.mjs';
 import { createWorker } from './worker.mjs';
 import { id } from './store.mjs';
-import { claim, content, TYPE, reconcileProof } from './external.mjs';
+import { claim, content, matchesContent, TYPE, reconcileProof } from './external.mjs';
 import path from 'node:path';
 import { securePath } from './platform.mjs';
 
@@ -175,7 +175,7 @@ export class Runtime {
     if (m?.customType === TYPE) {
       if (this.active && !this.active.candidate) { this.active.focus = false; this.active.answer = ''; this.active.assistantSeen = false; }
       // Event observation is not append evidence. Defer reconciliation until the hook returns.
-      const r = Object.values(this.store.read().external).find(r => r.internal === m.details?.internal && r.claim === m.details?.claim && r.digest === m.details?.digest && m.content === content(r));
+      const r = Object.values(this.store.read().external).find(r => r.internal === m.details?.internal && r.claim === m.details?.claim && r.digest === m.details?.digest && matchesContent(r, m.content));
       if (r) this.externalWrites.set(r.internal, { ...this.externalWrites.get(r.internal), observed: true });
       this.schedule(); return;
     }

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { accountIdentity, securePath, windowsHelper, windowsPath } from './platform.mjs';
+import { compact, NATIVE_BYTES, STATE_BYTES } from './ledger.mjs';
 
 export const id = () => crypto.randomUUID();
 export const live = pid => { if (!Number.isSafeInteger(pid) || pid <= 0) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
@@ -45,7 +46,7 @@ export class Store {
     securePath(this.file);
     const fd = fs.openSync(this.file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     try {
-      if (fs.fstatSync(fd).size > 16 * 1024 * 1024) throw Error('State size limit reached');
+      if (fs.fstatSync(fd).size > STATE_BYTES) throw Error('State size limit reached');
       const s = JSON.parse(fs.readFileSync(fd, 'utf8'));
       if (s.v !== 2) throw Error('Unknown state version; use an empty v2 root, no automatic migration');
       return s;
@@ -72,11 +73,11 @@ export class Store {
       securePath(this.lock, true);
       const ownerFd = fs.openSync(owner, 'wx', 0o600);
       try { securePath(owner); fs.writeFileSync(ownerFd, JSON.stringify({ pid: process.pid })); } finally { fs.closeSync(ownerFd); }
-      const s = this.read(); result = fn(s);
+      const s = this.read(); compact(s); result = fn(s); compact(s);
       // Keep native growth from consuming the external transition reserve.
-      if (Buffer.byteLength(JSON.stringify({ sessions:s.sessions, requests:s.requests, creates:s.creates })) > 8 * 1024 * 1024) throw Error('Native state capacity reached');
+      if (Buffer.byteLength(JSON.stringify({ sessions:s.sessions, requests:s.requests, creates:s.creates })) > NATIVE_BYTES) throw Error('Native state capacity reached');
       const body = JSON.stringify(s);
-      if (Buffer.byteLength(body) > 16 * 1024 * 1024) throw Error('State size limit reached; retained identities must not be evicted');
+      if (Buffer.byteLength(body) > STATE_BYTES) throw Error('State size limit reached; retained identities must not be evicted');
       const fd = fs.openSync(tmp, 'wx', 0o600);
       try { securePath(tmp); fs.writeFileSync(fd, body); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
       if (fs.existsSync(this.file)) securePath(this.file);

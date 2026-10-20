@@ -239,6 +239,7 @@ Capabilities returns `{v:1,ok:true,capabilities:{protocol:1,
 contract:"pi-a2a-external-v1",operations:["capabilities","lookup","send","status","cancel"],
 delivery:["queue","steer"],expectReply:false,maxCaller:48,maxRequestId:96,
 maxTextBytes:32768,maxInputBytes:262144,maxOutputBytes:8192,
+maxRetainedIdentities:50000,maxActivePayloads:128,capacityScope:"shared_ledger",maxStateBytes:134217728,
 inspection:"read_only",targetSnapshot:true,reservation:false}}`.
 It is a static supported contract: **no filesystem access or store creation**.
 Caller `docket-<32 lowercase hex>` and request `msg_<32 hex>` fit the bounds.
@@ -266,7 +267,7 @@ injection intent; injected means facade return or stronger saved evidence;
 observed means exact message event or stronger saved evidence. **Consumed alone
 means exact saved-session intake**: a complete newline JSONL entry under the
 right session header, distinct `pi-a2a-external-v1` custom type, internal ID,
-claim token, immutable digest and deterministic content, with receipt proof
+claim token, immutable digest and cryptographically exact deterministic content, with receipt proof
 persisted before reporting it. Neither message_start/end, in-memory entries,
 facade return, assistant output nor settlement is saved-consumption proof.
 Pi 1.0.4 emits message_end before its writer appends. Hooks return before deferred
@@ -276,7 +277,11 @@ reconciliation reads the file; status may safely advance saved-proof scanning.
 `partial_header`, `session_mismatch`, `oversized_record`, `invalid_record`,
 `partial_record`, `scanning`, `absent`, `unreadable`, `saved_exact`, `deadline`,
 `owner_unavailable`. Scans read at most 256 KiB per reconciliation, with 8 KiB
-header and 224 KiB record bounds (including worst-case escaped valid text). Missing/partial/oversized/ambiguous evidence
+header and 224 KiB record bounds (including worst-case escaped valid text).
+One file window is scanned per transaction, round-robin across unresolved files.
+Oversized records persist bounded discard offsets across restarts and EOF;
+discarded bytes are never parsed as proof, and scanning resumes only after their
+newline. An unfinished discard never reports `absent`. Missing/partial/oversized/ambiguous evidence
 never proves intake; progress may require subsequent status calls/sweeps.
 The receipt contains no payload or transcript path. Saved intake is historical,
 not model understanding, execution success, or an fsync/power-loss guarantee.
@@ -296,9 +301,35 @@ Owners advertise capability, persistence path, random epoch and heartbeat;
 admission and claim both check them. A live PID alone does not qualify an old
 owner. Changed owner epoch fails pending work rather than retargeting it.
 No-session mode cannot receive new machine wakes. There is no lock stealing.
-External identities and tombstones are retained, maximum 128, with byte admission
-ceilings reserving transition space (external admission ceiling 6 MiB, plus at
-most one bounded new record; native collections capped at 8 MiB). Capacity rejects **new identities**, not
+External identities and tombstones are retained permanently: **50,000 globally
+per shared ledger**, not per caller or target. Active payloads have a separate
+128-slot bound; cancellation, failure or irreversible claim releases a slot.
+This admits five finite 100-wake jobs without lifetime exhaustion; five/minute
+continuously still exhausts 50,000 identities in just under seven days. Choose
+capacity explicitly; there is no indefinitely reusable identity budget.
+
+The single JSON ledger is capped at **128 MiB**, native collections at 8 MiB.
+New identities are rejected if their actual external JSON bytes (including
+escaped payload/path and scanner state) plus **1 KiB per retained identity**
+exceed 112 MiB, or either count/active-slot limit is reached. Candidate bytes
+are charged before commit, not one record after the ceiling. Transcript paths
+are bounded to 4096 UTF-8 bytes and owner epochs to 96 characters. This reserve
+covers bounded claim/fact/proof/cursor growth even when new IDs are full;
+scanner metadata is outside native accounting. Count capacity is not a promise
+that arbitrary worst-case paths/payloads fit the byte cap. All operations read
+the bounded ledger into memory and transactions rewrite it; this is not a
+throughput/latency benchmark or a database service.
+
+Compaction is part of the **same locked atomic Store transaction** as terminal
+or irreversible claim facts, never a multi-file migration. Finished/claimed
+payload text is dropped only with immutable body and framed-content SHA-256
+digests retained. Claimed receipts retain internal ID, claim token and original
+file/session association until exact saved evidence resolves uncertainty;
+later content must hash identically, as well as match all exact association
+fields. Saved entry IDs and raw records are retained only as SHA-256 digests.
+Proof releases now-unneeded file cursors, not identity barriers or receipt facts.
+Same-key/same-body remains lookup-only; changed bodies still conflict even
+after payload compaction. Capacity rejects **new identities**, not
 status/transitions/idempotent operations on existing ones. There is no TTL,
 eviction, automatic archive, or ID reuse. Reserve IDs in the caller's durable
 outbox; status UNKNOWN after a lost commit response is not authority to mint a
@@ -380,7 +411,7 @@ call timeouts, at most 1,000 message records, the actual admitted request ID,
 its closing idle record, and an inactive session. Off-page/ambiguous history
 is not guessed. A restarted origin must match the pinned configuration.
 
-State is bounded to 128 sessions, 2,048 requests and 16 MiB; text is bounded to
+State is bounded to 128 sessions, 2,048 native requests and 128 MiB total (8 MiB native collections); text is bounded to
 32 KiB, and routes to four hops. History is retained until offline operator
 archival, not silently garbage-collected. Full stores reject new admissions.
 No state deletion is part of installation or normal recovery.
@@ -482,7 +513,17 @@ npm test
 
 The portable suite uses temporary canonical state roots, synthetic messages,
 fake HTTP/event and RPC boundaries, injected lifecycle callbacks, and a short
-owned Node process for real lock contention. No model/auth calls are made.
+owned Node process for real lock contention. External race tests use two
+overlapping, barrier-controlled owned processes at most, covering send/send,
+send/cancel, both cancel/claim orders and claim/claim. Busy operations retry
+only the same key after both processes exit, never runtime injection replay.
+Coverage includes unknown-cancel/restart/delayed retry, multi-window oversize
+discard/restart/EOF/append, near-8-MiB native state plus proof and ordinary
+reconciliation, 128 active slots, and a realistically sized 50,000-identity
+compact fixture with known-key conflicts/cancel and late exact proof at full
+count. This is fixture metadata, not 50,000 model/CLI requests. Test runners
+must have an outer 120-second watchdog (the capacity case also has a 120-second
+test timeout). No model/auth calls are made.
 Windows path/account/helper/launcher checks in this suite are clearly labeled
 portable mocks or source-policy assertions: they do not execute PowerShell or
 prove native ACLs. Native fixture provisioning must use dedicated protected
@@ -517,7 +558,8 @@ automatic reverse bridge, OS sandbox or exactly-once guarantee is provided.
 Source map: `index.ts` registers tools/hooks; `src/runtime.mjs` handles mailbox
 delivery and settlement; `store.mjs` owns transactions; `protocol.mjs` owns
 envelopes and correlation; `opencode.mjs` owns HTTP/SSE; `worker.mjs` owns RPC
-workers; `external.mjs` owns external claims/receipts/proof; `machine.mjs` owns
+workers; `external.mjs` owns external claims/receipts/proof; `ledger.mjs` owns
+compact retention and capacity constants; `machine.mjs` owns
 strict stdin parsing; `platform.mjs` and `windows-security.ps1` implement the
 account/security seam; `launch.mjs` validates native Node/Pi JS launch;
 `cli.mjs` is the trusted local companion. Bug reports should use a
