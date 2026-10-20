@@ -317,6 +317,9 @@ after 250 ms, not an unbounded synchronous drain. Busy operations stop the pass;
 only local idempotent updates retry, and retained claims prevent facade replay.
 Network/facade promises are not awaited by this scheduler. Late results require
 the same Runtime context and a fresh owned transaction before persistence.
+An overdue standalone heartbeat may overtake lane rotation only once per pass;
+normal mutation lanes renew themselves at callback time, even if a slow commit
+tail returns already overdue. This prevents heartbeat-only priority livelock.
 
 Only the live registered Runtime's **exact PID + owner epoch + online record**
 can renew its own heartbeat during normal owned work, at the unchanged 20-second

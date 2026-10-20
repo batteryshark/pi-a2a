@@ -108,6 +108,75 @@ test('bounded round-robin work yields real timers and progresses native/external
     assert.equal(f.calls.length,6,'unresolved facade promises never block or replay');
   } finally {clearInterval(timer);await f.close();}
 });
+// Synthetic finite pre/callback/post/read costs, NOT measured native timings.
+for(const scenario of [
+  {name:'overdue on return',pre:13999,callback:1,post:22000,read:3450,gap:30000},
+  {name:'shorter return tail',pre:15828,callback:1,post:10456,read:3450,gap:30000},
+  {name:'expired before service',pre:13999,callback:1,post:22000,read:3450,gap:300001}
+]) test(`finite slow units cannot monopolize rotating work with priority heartbeats: ${scenario.name}`,async t=>{
+  const realNow=Date.now;let now=100000,enabled=false,inTx=false,lane='priority-heartbeat',ticks=0;
+  let f,read,tx,originalTurn;const methods=new Map(),units=[],lanes=[];
+  let attempts=0,callbacks=0;
+  Date.now=()=>now;
+  try {
+    f=fixture({now:()=>now});
+    const r=f.r,store=r.store,x=send('slow-unit');
+    operate(store,x,()=>now);
+    store.tx(s=>{s.requests.expired={id:'expired',from:r.self,to:'pi/other',status:'queued',expectReply:false,deadline:0};});
+    const deadline=store.read().external[requestKey(x)].deadline;
+    read=store.read;tx=store.tx;originalTurn=r.turn;
+    store.read=function(){const s=read.call(this);if(enabled&&!inTx)now+=scenario.read;return s;};
+    store.tx=function(fn){
+      if(!enabled)return tx.call(this,fn);
+      attempts++;const start=now;let cb,hb;
+      inTx=true;
+      try {
+        const result=tx.call(this,s=>{now+=scenario.pre;cb=now;callbacks++;const value=fn(s);hb=s.sessions[r.self].heartbeat;now+=scenario.callback;return value;});
+        now+=scenario.post;
+        units.push({lane,start,cb,end:now,hb,tick:ticks});return result;
+      } finally {inTx=false;}
+    };
+    r.turn=async function(){assert.equal(inTx,false,'real turns occur outside transactions');const ready=await originalTurn.call(this);ticks++;return ready;};
+    for(const method of ['reconcileExternal','dispatchExternal','reconcileNative','flushWrite','dispatchNative','completeCandidate','deliverReply']){
+      const original=r[method];methods.set(method,original);
+      r[method]=function(...args){const previous=lane;lane=method;lanes.push({lane,cursor:this.laneNext});try{return original.apply(this,args);}finally{lane=previous;}};
+    }
+    now+=scenario.gap;enabled=true;
+    for(let pass=0;pass<3;pass++){
+      const first=units.length,firstLane=lanes.length;
+      await r.reconcile();
+      const successful=units.slice(first);
+      assert.ok(successful.length<=8,'successful mutation units stay inside the eight-unit budget');
+      assert.ok(successful.filter(u=>u.lane==='priority-heartbeat').length<=1,'at most one standalone priority heartbeat per pass');
+      if(pass===0){
+        assert.ok(lanes.length>firstLane,'overdue return still permits rotating lane service');
+        assert.ok(lanes.slice(firstLane).some(l=>l.cursor!==0),'lane cursor advances beyond priority-only state');
+      }
+      assert.ok(successful.every(u=>u.hb===u.cb),'ledger heartbeat retains actual callback time');
+      assert.ok(successful.every(u=>u.end-u.hb===scenario.callback+scenario.post),'finite post-callback cost remains visible, not hidden by fake freshness');
+      if(successful.length)assert.equal(r.lastHeartbeat,successful.at(-1).hb,'scheduling hint also retains callback time');
+      assert.equal(attempts,callbacks,'no busy or failed acquisition is counted as callback success');
+      assert.equal(callbacks,units.length,'every recorded transaction really completed once');
+      assert.equal(new Set(successful.map(u=>u.tick)).size,successful.length,'a real timer turn separates mutation units');
+      const s=read.call(store),row=s.external[requestKey(x)];
+      assert.equal(s.requests.expired.status,'timeout','native deadline writes progress');
+      if(scenario.gap>300000){assert.equal(row.state,'failed');assert.equal(row.evidence,'deadline');assert.equal(row.claim,undefined);assert.equal(f.calls.length,0);}
+      else {
+        assert.ok(row.claim,'live-deadline external claim progresses');assert.equal(f.calls.length,1);
+        if(pass===0)assert.ok(units.find(u=>u.lane==='dispatchExternal').cb<deadline,'claim is made before the unchanged deadline');
+      }
+    }
+    const s=read.call(store),row=s.external[requestKey(x)];
+    assert.equal(row.proof,undefined,'facade delivery never manufactures saved intake');
+    assert.equal(f.calls.length,scenario.gap>300000?0:1,'later passes never replay a facade');
+    t.diagnostic(JSON.stringify({scenario:scenario.name,attempts,callbacks,priorityHeartbeats:units.filter(u=>u.lane==='priority-heartbeat').length,facades:f.calls.length,external:row.state,native:s.requests.expired.status}));
+  } finally {
+    enabled=false;
+    if(f){if(read)f.r.store.read=read;if(tx)f.r.store.tx=tx;if(originalTurn)f.r.turn=originalTurn;for(const [method,original] of methods)f.r[method]=original;}
+    try {if(f){await f.close();assert.equal(f.r.turns.size,0);assert.equal(f.r.children.size,0);assert.equal(f.r.reconciling,null);}}
+    finally {Date.now=realNow;if(f)f.r.now=realNow;}
+  }
+});
 test('owned renewal is exact PID/epoch/online only; lookup and companion status do not renew',async()=>{
   for(const field of ['epoch','pid','online']) {
     let now=100000;const f=fixture({now:()=>now});

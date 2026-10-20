@@ -195,12 +195,16 @@ export class Runtime {
         dispatch:this.active ? [] : requests.filter(r => r.to===this.self && !terminal(r) && !r.injected).slice(0,1).map(r=>r.id)
       };
       const lanes = ['maintenance','pending','candidate','native','replies','dispatch','external'];
-      let maintained = false, candidateDone = false;
+      let maintained = false, candidateDone = false, priorityHeartbeatDone = false;
       const pendingDone=new Set();
       for (let budget=0; budget<8 && !this.closed && !this.lostOwner; budget++) {
         if (this.busySeen) {this.moreWork=true;return;}
         let action;
-        if (this.now()-this.lastHeartbeat>20000) action=()=>this.ownedTx(()=>{});
+        // A slow post-callback tail may return overdue. Overtake only once;
+        // eligible mutation lanes renew their own heartbeat at callback time.
+        if (!priorityHeartbeatDone && this.now()-this.lastHeartbeat>20000) {
+          priorityHeartbeatDone=true;action=()=>this.ownedTx(()=>{});
+        }
         for (let tries=0; tries<lanes.length && !action; tries++) {
           const lane=lanes[this.laneNext]; this.laneNext=(this.laneNext+1)%lanes.length;
           if (lane==='maintenance') {
