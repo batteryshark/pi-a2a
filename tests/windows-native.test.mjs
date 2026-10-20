@@ -75,6 +75,39 @@ test('native protected root, inherited payload, transaction lock/temp and restar
     assert.throws(()=>securePath(link)); fs.unlinkSync(link);
   } finally { fs.rmSync(root,{recursive:true,force:true}); }
 });
+test('native internal helper framing: bounded optional encoding signature and strict negatives', {skip:!native,timeout:90000},t=>{
+  const root=fixtureRoot('native-\ufeff-framing-');let passed=false;
+  const helper=fileURLToPath(new URL('../src/windows-security.ps1',import.meta.url));
+  const ps=path.join(process.env.SystemRoot,'System32/WindowsPowerShell/v1.0/powershell.exe');
+  const identity='{"op":"identity"}';
+  const boundary=JSON.stringify({op:'identity',padding:'x'.repeat(2048-JSON.stringify({op:'identity',padding:''}).length)});
+  const probe=(name,input,status)=>{
+    const r=spawnSync(ps,['-NoLogo','-NoProfile','-NonInteractive','-File',helper],{input,encoding:'utf8',timeout:10000,maxBuffer:8192,shell:false,windowsHide:true});
+    assert.equal(r.status,status,`${name}: ${r.stdout}${r.stderr}`);assert.equal(r.stderr,'');
+    const response=JSON.parse(r.stdout.replace(/^\ufeff/,''));assert.equal(response.ok,status===0,name);
+    t.diagnostic(`${name}: exit ${r.status}`);
+  };
+  try {
+    probe('no signature',Buffer.from(identity),0);
+    probe('single raw UTF8 signature (decoder handling unobserved)',Buffer.from('\ufeff'+identity),0);
+    // Three raw signatures leave repeated decoded prefixes even if Console
+    // consumes one encoding signature; do not claim which decoder path ran.
+    probe('repeated framing prefixes',Buffer.from('\ufeff\ufeff\ufeff'+identity),3);
+    probe('noninitial signature is not whitespace',Buffer.from(' \ufeff'+identity),3);
+    probe('malformed JSON',Buffer.from('\ufeff{'),3);
+    probe('strict invalid UTF8 inside otherwise valid JSON',Buffer.concat([Buffer.from('{"op":"identity","padding":"'),Buffer.from([0xc3,0x28]),Buffer.from('"}')]),3);
+    assert.equal(boundary.length,2048);probe('raw character boundary',Buffer.from(boundary),0);
+    probe('raw over2048 characters',Buffer.from(boundary+' '),3);
+    probe('signature cannot rescue over2048 body',Buffer.from('\ufeff'+boundary+' '),3);
+    assert.equal(fs.existsSync(root.replace('\ufeff','')),false);
+    probe('inside-string path signature is preserved',Buffer.from(JSON.stringify({op:'verifyRoot',path:root})),0);
+    probe('inside-string operation signature is not stripped',Buffer.from(JSON.stringify({op:'\ufeffidentity'})),3);
+    passed=true;
+  } finally {
+    if(!passed&&process.env.PI_A2A_TEST_RETAIN_FAILURE==='1')console.error(`Retained owned framing fixture: ${root}`);
+    else fs.rmSync(root,{recursive:true,force:true});
+  }
+});
 for(const mode of ['creation','evidence','reader']) test(`native explicit constructors/exclusivity and evidence roles: ${mode}`, {skip:!native,timeout:90000}, t=>{
   const root=fixtureRoot('native-create-');
   let passed=false;

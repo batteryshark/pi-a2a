@@ -473,6 +473,9 @@ trusted package script launched with absolute system PowerShell, `-NoProfile
 10-second timeout and 8 KiB output bound. `SystemRoot` is trusted launcher
 environment identifying the genuine Windows installation; do not override it.
 No installs, execution-policy changes, ACL repairs or permission widening occur.
+Only this internal helper accepts one initial decoded U+FEFF encoding signature,
+after its raw 2048-character check; repeated/noninitial prefixes are not removed.
+The external `machine` JSON protocol still rejects BOM framing strictly.
 
 The immediate parent must exist. A **new dedicated leaf** is created with
 `DirectorySecurity` passed to `Directory.CreateDirectory(path, security)`:

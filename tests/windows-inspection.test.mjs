@@ -68,6 +68,16 @@ test('fixed PowerShell source contains restrictive atomic-create and explicit fa
   for(const text of ['WindowsIdentity]::GetCurrent().User','SetAccessRuleProtection($true,$false)','CreateDirectory($p,$d)','AreAccessRulesProtected','DiscretionaryAcl','ReparsePoint','DriveFormat','NTFS','AccessDenied','ancestor owner']) assert.ok(ps.includes(text),text);
   assert.ok(!ps.includes('Set-Acl')); assert.ok(!ps.includes('Invoke-Expression'));
 });
+test('internal helper strips one initial decoded signature after raw bound; external machine still rejects BOM (source/portable)',()=>{
+  const ps=fs.readFileSync(new URL('../src/windows-security.ps1',import.meta.url),'utf8');
+  const strip='if ($inputText.Length -gt 0 -and $inputText[0] -eq [char]0xFEFF) { $inputText = $inputText.Substring(1) }';
+  assert.ok(ps.indexOf('$inputText.Length -gt 2048')<ps.indexOf(strip));
+  assert.ok(ps.indexOf(strip)<ps.indexOf('$q = ConvertFrom-Json $inputText'));
+  assert.equal(ps.split('$inputText = $inputText.Substring(1)').length-1,1);
+  assert.ok(!ps.includes('TrimStart'));
+  for(const prefix of ['\ufeff','\ufeff\ufeff',' \ufeff'])assert.throws(()=>parse(Buffer.from(prefix+'{"v":1,"op":"capabilities"}')),{code:'INVALID_JSON'});
+  assert.equal(frame({v:1,op:'send',caller:'fixture',id:'signature-data',to:'pi/fixture',text:'a\ufeffb',delivery:'queue',expectReply:false}).text,'a\ufeffb');
+});
 test('native Node plus Pi JS entry uses separate argv, package metadata, minimum version (MOCK)',()=>{
   const entry='C:\\Packages\\pi\\dist\\cli.js', node='C:\\Runtime\\node.exe', seen=[];
   const config={platform:'win32',env:{PI_A2A_PI_ENTRY:entry},execPath:node,version:'22.23.3',verify:(...x)=>seen.push(x),io:{

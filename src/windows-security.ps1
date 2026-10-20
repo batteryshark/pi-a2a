@@ -7,6 +7,7 @@ try {
   [Console]::OutputEncoding = New-Object Text.UTF8Encoding ($false)
   $inputText = [Console]::In.ReadToEnd()
   if ($inputText.Length -gt 2048) { throw 'limit' }
+  if ($inputText.Length -gt 0 -and $inputText[0] -eq [char]0xFEFF) { $inputText = $inputText.Substring(1) }
   $q = ConvertFrom-Json $inputText
   $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
   . (Join-Path $PSScriptRoot 'windows-policy.ps1')
