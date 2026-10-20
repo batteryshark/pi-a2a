@@ -174,8 +174,10 @@ test('blocked UI is nonterminal; dedup does not repeat OpenCode effect; expired 
     assert.equal(a.store.read().requests[r.id].status, 'blocked'); b.blocked(false);
     assert.equal(a.store.read().requests[r.id].status, 'queued');
     const opts = { id: 'stable' }; await a.send('oc/ses_fake_test', 'x', opts); await a.send('oc/ses_fake_test', 'x', opts);
-    assert.equal(sends, 1); a.now = () => Date.now() + 200000; await a.reconcile();
+    assert.equal(sends, 1); a.now = () => Date.now() + 200000;
+    await reconcileUntil(a,()=>a.store.read().requests.stable.status==='timeout');
     assert.equal(a.store.read().requests.stable.status, 'timeout');
+    assert.equal(sends, 1,'deadline reconciliation never repeats the external send');
   } finally { await b.close(); await a.close(); }
 });
 test('inbound logical request stays open across detached nested reply; no interim final', async () => {
@@ -224,25 +226,51 @@ test('reply before original settlement can synthesize, and duplicate end event d
   } finally { await c.close(); await b.close(); await a.close(); }
 });
 
-test('three-level nested return requires synthesis at every ancestor in adverse order', async () => {
+// A reconcile call may join an already-running pass with an older snapshot.
+// Wait for the actual normal queue/active condition, not an arbitrary one pass.
+async function reconcileUntil(r, condition) {
+  for (let i=0;i<8&&!condition();i++) {await new Promise(resolve=>setTimeout(resolve,0));await r.reconcile();}
+  assert.ok(condition(),'expected queue/active state within eight normal reconciliation passes');
+}
+const hasReply=(r,id)=>r.messages.some(([m])=>m.details?.replyId===`${id}-reply`);
+for (const controlled of [false,true]) test(`three-level nested return requires synthesis at every ancestor in adverse order${controlled?' with a shared pre-settlement snapshot':''}`, async () => {
   const dir = root(), peers = ['a', 'b', 'c', 'd'].map(id => make(dir, id)); const [a, b, c, d] = peers;
+  let release=()=>{};
   for (const r of peers) r.start();
   try {
-    const ab = await a.send('pi/b', 'delegate'); await b.reconcile(); inbound(b);
+    const ab = await a.send('pi/b', 'delegate'); await reconcileUntil(b,()=>b.active?.id===ab.id); inbound(b);
     const bc = await b.send('pi/c', 'delegate'); answer(b, 'B INTERIM');
     const sibling = await b.send('pi/d', 'sibling');
-    await d.reconcile(); inbound(d); answer(d, 'sibling answer'); d.settled(); await b.reconcile(); reply(b, sibling.id);
+    await reconcileUntil(d,()=>d.active?.id===sibling.id); inbound(d); answer(d, 'sibling answer'); d.settled(); await reconcileUntil(b,()=>hasReply(b,sibling.id)); reply(b, sibling.id);
     answer(b, 'still interim'); b.settled();
     assert.equal(a.store.read().requests[ab.id].status, 'blocked');
-    await c.reconcile(); inbound(c); const cd = await c.send('pi/d', 'deep'); answer(c, 'C INTERIM');
-    await d.reconcile(); inbound(d); answer(d, 'deep answer'); d.settled();
+    await reconcileUntil(c,()=>c.active?.id===bc.id); inbound(c); const cd = await c.send('pi/d', 'deep'); answer(c, 'C INTERIM');
+    await reconcileUntil(d,()=>d.active?.id===cd.id); inbound(d); answer(d, 'deep answer'); d.settled();
     c.settled(); assert.equal(a.store.read().requests[bc.id].status, 'blocked');
-    await c.reconcile(); reply(c, cd.id); answer(c, 'C SYNTHESIS'); c.settled();
+    let existing;
+    if (controlled) {
+      await b.reconcile();
+      const turn=b.turn.bind(b);let turns=0,ready;
+      const snapshot=new Promise(resolve=>{ready=resolve;});
+      const gate=new Promise(resolve=>{release=resolve;});
+      b.turn=async()=>{const result=await turn();if(++turns===2){ready();await gate;}return result;};
+      existing=b.reconcile();
+      await Promise.race([snapshot,existing.then(()=>{throw Error('pass ended before controlled snapshot gate');})]);
+      assert.equal(a.store.read().requests[bc.id].status,'blocked');
+    }
+    await reconcileUntil(c,()=>hasReply(c,cd.id)); reply(c, cd.id); answer(c, 'C SYNTHESIS'); c.settled();
     assert.equal(a.store.read().requests[bc.id].answer, 'C SYNTHESIS');
     answer(b, 'UNRELATED'); b.settled(); assert.equal(a.store.read().requests[ab.id].status, 'blocked');
-    await b.reconcile(); reply(b, bc.id); answer(b, 'B SYNTHESIS'); b.settled();
+    if (controlled) {
+      assert.equal(b.reconcile(),existing,'call joins pre-settlement snapshot, not a new pass');
+      release();await existing;
+      assert.equal(hasReply(b,bc.id),false,'old snapshot cannot enqueue a newly settled return');
+      assert.equal(b.moreWork,true,'final snapshot schedules the missing return');
+    }
+    await reconcileUntil(b,()=>hasReply(b,bc.id)); reply(b, bc.id); answer(b, 'B SYNTHESIS'); b.settled();
     assert.equal(a.store.read().requests[ab.id].answer, 'B SYNTHESIS');
-  } finally { for (const r of peers.reverse()) await r.close(); }
+    for (const [r,id] of [[b,sibling.id],[c,cd.id],[b,bc.id]]) assert.equal(r.messages.filter(([m])=>m.details?.replyId===`${id}-reply`).length,1,'exactly one queued correlated reply');
+  } finally { release();for (const r of peers.reverse()) await r.close(); }
 });
 
 test('independent outgoing request cannot hold or resolve an inbound request', async () => {

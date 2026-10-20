@@ -210,7 +210,9 @@ export class Runtime {
               action=()=>this.reconcileExternal(); maintained=true;
             }
           } else if (lane==='candidate') {
-            if (!candidateDone && this.active?.candidate) {candidateDone=true;action=()=>this.completeCandidate();}
+            // Terminal cleanup releases a hung/timed-out slot even when no
+            // settlement candidate ever existed. Nonterminal waits stay active.
+            if (!candidateDone && this.active) {candidateDone=true;action=()=>this.completeCandidate();}
           } else {
             const id=lane==='pending' ? this.rotated('pending',[...this.pendingWrites.keys()].filter(id=>!pendingDone.has(id)))[0] : queues[lane].shift();
             if (id!==undefined) {

@@ -38,12 +38,51 @@ test('fresh claim rejects stale heartbeat; claimed/cancelled keys never revive u
   operate(n,{v:1,op:'cancel',caller:'fixture',id:'late'},n.clock);
   assert.throws(()=>operate(n,send('late'),n.clock),{code:'CANCELLED'});
 });
+test('default claim clock is sampled inside acquisition, not at entry',()=>{
+  for (const [cost,evidence] of [[70000,'owner_unavailable'],[300000,'deadline']]) {
+    const m=memory();operate(m,send(),m.clock);m.set(0,cost);
+    const real=Date.now;Date.now=m.clock;
+    try {assert.equal(claim(m,requestKey(send()),'pi/owner','fixture'),null);}
+    finally {Date.now=real;}
+    assert.equal(m.state().external[requestKey(send())].evidence,evidence);
+    assert.equal(m.state().sessions['pi/owner'].heartbeat,0);
+  }
+});
 function fixture(extra={}) {
   const dir=fixtureRoot('a2a-fair-'),file=path.join(dir,'session.jsonl'),calls=[];
   fs.writeFileSync(file,JSON.stringify({type:'session',id:'owner'})+'\n');
   const r=new Runtime({root:dir,session:'owner',cwd:dir,transcript:()=>file,sendMessage:m=>{calls.push(m);},...extra});r.start();
   return {dir,r,calls,async close(){await r.close();fs.rmSync(dir,{recursive:true,force:true});}};
 }
+test('terminal native active maintenance releases a no-candidate timeout but preserves nonterminal blocked work',async()=>{
+  let now=100000;const real=Date.now;Date.now=()=>now;
+  const f=fixture({now:()=>now});
+  const sender=new Runtime({root:f.dir,session:'sender',cwd:f.dir,now:()=>now,sendMessage:()=>{}});sender.start();
+  const pump=async condition=>{
+    for(let i=0;i<8&&!condition();i++){await new Promise(r=>setTimeout(r,0));await f.r.reconcile();}
+    assert.ok(condition(),'native work progresses within eight normal passes');
+  };
+  try {
+    const first=await sender.send(f.r.self,'Synthetic hung native turn');
+    await pump(()=>f.r.active?.id===first.id);
+    assert.equal(f.r.active.candidate,undefined);
+    f.r.blocked(true);
+    for(let i=0;i<3;i++)await f.r.reconcile();
+    assert.equal(f.r.store.read().requests[first.id].status,'blocked');
+    assert.equal(f.r.active.id,first.id,'absence of a candidate cannot clear a nonterminal blocked request');
+    assert.equal(f.r.active.candidate,undefined);assert.equal(f.calls.length,1);
+    now=f.r.store.read().requests[first.id].deadline+1;
+    await pump(()=>f.r.store.read().requests[first.id].status==='timeout'&&!f.r.active);
+    const second=await sender.send(f.r.self,'Synthetic next valid native turn');
+    assert.ok(f.r.store.read().requests[second.id].deadline>now);
+    await pump(()=>f.r.active?.id===second.id);
+    for(let i=0;i<3;i++)await f.r.reconcile();
+    const rows=f.r.store.read().requests;
+    assert.equal(rows[first.id].status,'timeout');assert.equal(rows[second.id].status,'queued');
+    assert.equal(rows[second.id].injected,true);
+    assert.deepEqual(f.calls.map(m=>m.details.request),[first.id,second.id],'one native facade per request, no replay');
+  } finally {try {await sender.close();await f.close();} finally {Date.now=real;}}
+});
 test('bounded round-robin work yields real timers and progresses native/external lanes with owned heartbeat',async()=>{
   let now=100000,ticks=0,txs=0;const trace=[];
   const f=fixture({now:()=>now,sendMessage:m=>{f.calls.push(m);return new Promise(()=>{});}});
@@ -138,6 +177,31 @@ test('unresolved OC outcome does not block heartbeat; late completion cannot bea
       if(replace)assert.equal(state.sessions[f.r.self].heartbeat,hb);
     } finally {await f.close();}
   }
+});
+test('deadline fixture joining a pre-clock-change snapshot requires a fresh normal pass, never a repeated effect',async()=>{
+  let sends=0,outcomes=0,release=()=>{};
+  const f=fixture({oc:{url:'http://127.0.0.1:1',send:async()=>{sends++;},events:async()=>{},outcome:async()=>{outcomes++;return {status:'completed',answer:'too late'};}}});
+  try {
+    await f.r.reconcile();
+    const turn=f.r.turn.bind(f.r);let turns=0,ready;
+    const snapshot=new Promise(resolve=>{ready=resolve;});
+    const gate=new Promise(resolve=>{release=resolve;});
+    // Hold only the real turn AFTER the verified read, never a Store lock.
+    f.r.turn=async()=>{const result=await turn();if(++turns===2){ready();await gate;}return result;};
+    const existing=f.r.reconcile();
+    await Promise.race([snapshot,existing.then(()=>{throw Error('pass ended before controlled snapshot gate');})]);
+    assert.equal(f.r.store.read().requests.stable,undefined);
+    const opts={id:'stable'};
+    await f.r.send('oc/ses_fixture','Synthetic deadline',opts);await f.r.send('oc/ses_fixture','Synthetic deadline',opts);
+    assert.equal(sends,1);f.r.now=()=>Date.now()+200000;
+    assert.equal(f.r.reconcile(),existing,'call joins snapshot preceding admission and clock change');
+    release();await existing;
+    assert.equal(f.r.store.read().requests.stable.status,'sent');assert.equal(f.r.moreWork,true);
+    for(let i=0;i<8&&f.r.store.read().requests.stable.status!=='timeout';i++){await new Promise(r=>setTimeout(r,0));await f.r.reconcile();}
+    assert.equal(f.r.store.read().requests.stable.status,'timeout');
+    assert.equal(sends,1,'normal timeout reconciliation never replays external admission');
+    assert.equal(outcomes,0,'expired work is not collected as completed');
+  } finally {release();await f.close();}
 });
 test('compacted claim persists facade/event facts without treating either as saved consumption',async()=>{
   const f=fixture();
