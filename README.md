@@ -542,6 +542,7 @@ these fictional paths with reviewed local paths:
 
 ```powershell
 $env:PI_A2A_TEST_PARENT = 'C:\PrivateProof\owned-parent'
+& .\tests\windows-parent.ps1 -Path $env:PI_A2A_TEST_PARENT # must not exist
 $env:PI_A2A_PI_PACKAGE = 'C:\ReviewedPi\node_modules\@earendil-works\pi-coding-agent'
 $env:PI_A2A_PI_ENTRY = 'C:\ReviewedPi\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js'
 & 'C:\SupportedNode\node.exe' --test --test-concurrency=1 tests/windows-native.test.mjs
@@ -564,6 +565,11 @@ Tests modify only newly owned fixtures. Do not bypass execution policy if a
 helper is blocked. Native acceptance still requires successful host evidence,
 not a passing non-Windows skip or portable mock. Full portable suites may be
 much slower on Windows because each security check launches PowerShell.
+An elevated token whose default new-file owner is Administrators can fail the
+current-user payload-owner check even below a protected current-user-owned root.
+That is unsupported, not authority to accept privileged-owned payloads or change
+the token/ACL policy. Likewise, an installed Node with ordinary-user write grants
+fails trusted launch verification; do not repair its installation to run a test.
 
 Optional installed-Pi checks are separate from `npm test`. Point the package
 variable at your already installed **Pi 1.0.4 package directory**, not its
