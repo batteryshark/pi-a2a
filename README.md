@@ -453,7 +453,10 @@ temporary state and worker transcripts inherit only from verified directories;
 files are verified before payload write, and existing files/transcripts checked.
 Directory FullControl must be inheritable by both files and directories.
 
-Ancestors must be owned by the user/SYSTEM/Administrators, non-reparse, and must
+Ancestors and launch files may additionally be owned by the exact Windows
+TrustedInstaller service SID and carry its privileged grants. This exception is
+OS-role-only: TrustedInstaller ownership or grants on payloads still fail.
+Ancestors must be owned by the user/SYSTEM/Administrators/TrustedInstaller, non-reparse, and must
 not grant ordinary principals delete/delete-child, ACL/owner change or write
 attributes/extended attributes. Ordinary ancestor read/traverse and create-sibling
 rights are not treated as access to the protected leaf. Launch files additionally
@@ -528,6 +531,39 @@ Windows path/account/helper/launcher checks in this suite are clearly labeled
 portable mocks or source-policy assertions: they do not execute PowerShell or
 prove native ACLs. Native fixture provisioning must use dedicated protected
 leaves, not the portable suite's POSIX temporary-root helpers.
+
+### Reusable native Windows tests
+
+Run in native Windows PowerShell with an already supported Node executable.
+Provision a **new protected NTFS proof parent at creation**, using the same
+reviewed DirectorySecurity/CreateDirectory policy as the helper; do not repair
+an existing directory or use ambient Temp. Verify its ancestors first. Replace
+these fictional paths with reviewed local paths:
+
+```powershell
+$env:PI_A2A_TEST_PARENT = 'C:\PrivateProof\owned-parent'
+$env:PI_A2A_PI_PACKAGE = 'C:\ReviewedPi\node_modules\@earendil-works\pi-coding-agent'
+$env:PI_A2A_PI_ENTRY = 'C:\ReviewedPi\node_modules\@earendil-works\pi-coding-agent\dist\bundle\cli.js'
+& 'C:\SupportedNode\node.exe' --test --test-concurrency=1 tests/windows-native.test.mjs
+& 'C:\SupportedNode\node.exe' --test --test-concurrency=1 tests/installed-pi.test.mjs
+```
+
+`npm run test:windows` is the equivalent focused native command when PATH Node
+is supported. Use an outer 180-second watchdog per command. Native fixture
+creation fails closed without `PI_A2A_TEST_PARENT`; all suite fixture roots use
+protected creation on Windows, never mkdtemp-then-ACL-repair. The POSIX chmod/
+symlink assertions are inapplicable there; native tests instead exercise real
+extra ordinary Read/Modify/delete-child grants, junctions and hardlinks.
+Descriptor tests execute the actual shared PowerShell policy with genuine .NET
+ACL objects, including TrustedInstaller positive OS roles and rejected payload/
+untrusted owners; synthetic owners are **not** filesystem-owner proof. The
+focused test also verifies actual OS launch descriptors without modifying them.
+It does not claim null/unknown-ACE, foreign filesystem-owner, sharing-violation,
+RPC worker or consumption coverage; installed-Pi and probe commands are separate.
+Tests modify only newly owned fixtures. Do not bypass execution policy if a
+helper is blocked. Native acceptance still requires successful host evidence,
+not a passing non-Windows skip or portable mock. Full portable suites may be
+much slower on Windows because each security check launches PowerShell.
 
 Optional installed-Pi checks are separate from `npm test`. Point the package
 variable at your already installed **Pi 1.0.4 package directory**, not its

@@ -11,10 +11,11 @@ import { parse } from '../src/machine.mjs';
 import { lookup } from '../src/external.mjs';
 import { Runtime } from '../src/runtime.mjs';
 import { EventEmitter } from 'node:events';
+import { fixtureRoot } from './fixture.mjs';
 
 // Portable policy/helper-invocation mocks, NOT native PowerShell/NTFS evidence.
 const roots=[];
-const root=()=>{ const p=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'a2a-policy-'))); roots.push(p); return p; };
+const root=()=>{ const p=fixtureRoot('a2a-policy-'); roots.push(p); return p; };
 test.after(()=>{for(const p of roots) fs.rmSync(p,{recursive:true,force:true});});
 const frame=x=>parse(Buffer.from(JSON.stringify(x)));
 test('inspection schemas are strict, caller-free, and support Docket identity lengths',()=>{
@@ -63,7 +64,7 @@ test('Windows account seam never calls getuid; helper invocation fixed argv, JSO
   for(const result of [{status:3,stdout:'private error'},{status:0,stdout:'{}'},{status:0,stdout:'invalid'},{status:0,stdout:'{"ok":true,"sid":"fake"}'},{error:Error('timeout')}]) assert.throws(()=>windowsHelper('identity',undefined,{...opts,run:()=>result}),e=>e.code==='UNSUPPORTED_SECURITY');
 });
 test('fixed PowerShell source contains restrictive atomic-create and explicit fail-closed checks (source only)',()=>{
-  const ps=fs.readFileSync(new URL('../src/windows-security.ps1',import.meta.url),'utf8');
+  const ps=fs.readFileSync(new URL('../src/windows-security.ps1',import.meta.url),'utf8')+fs.readFileSync(new URL('../src/windows-policy.ps1',import.meta.url),'utf8');
   for(const text of ['WindowsIdentity]::GetCurrent().User','SetAccessRuleProtection($true,$false)','CreateDirectory($p,$d)','AreAccessRulesProtected','DiscretionaryAcl','ReparsePoint','DriveFormat','NTFS','AccessDenied','ancestor owner']) assert.ok(ps.includes(text),text);
   assert.ok(!ps.includes('Set-Acl')); assert.ok(!ps.includes('Invoke-Expression'));
 });

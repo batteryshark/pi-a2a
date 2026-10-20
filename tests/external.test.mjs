@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { fixtureRoot } from './fixture.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,7 +13,7 @@ import { operate, claim, requestKey, content, TYPE, digest, capabilities } from 
 import { hash, NATIVE_BYTES, ADMISSION_BYTES, TRANSITION_BYTES, scanKey } from '../src/ledger.mjs';
 
 const roots = [];
-const root = () => { const d = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pi-a2a-wake-'))); roots.push(d); return d; };
+const root = () => { const d = fixtureRoot('pi-a2a-wake-'); roots.push(d); return d; };
 test.after(() => { for (const d of roots) fs.rmSync(d, { recursive:true, force:true }); });
 const send = (id='one', extra={}) => ({ v:1, op:'send', caller:'fixture', id, to:'pi/target', text:'synthetic wake', delivery:'queue', expectReply:false, ...extra });
 const query = (op, id='one', caller='fixture') => ({v:1, op, caller, id});

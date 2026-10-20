@@ -6,6 +6,7 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { Runtime } from '../src/runtime.mjs';
 import { operate, requestKey } from '../src/external.mjs';
+import { fixtureRoot } from './fixture.mjs';
 
 // Optional host-contract regression; all IDs/messages are synthetic.
 // Point at an already installed Pi package, never a fixed release location.
@@ -14,7 +15,7 @@ test('installed Pi busy queue loss retries stable reply after restart; only save
   assert.ok(installed && path.isAbsolute(installed), 'Set PI_A2A_PI_PACKAGE to the absolute installed pi-coding-agent package directory');
   const { AgentSession } = await import(pathToFileURL(path.join(installed, 'dist/core/agent-session.js')).href);
   const { SessionManager } = await import(pathToFileURL(path.join(installed, 'dist/core/session-manager.js')).href);
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pi-a2a-installed-')));
+  const dir = fixtureRoot('pi-a2a-installed-');
   const manager = SessionManager.create(dir, dir);
   manager.appendMessage({ role: 'user', content: 'zero-model persistence fixture', timestamp: Date.now() });
   const queue = [], adapter = { isStreaming: true, agent: { followUp: m => queue.push(m) } };
@@ -56,7 +57,7 @@ test('genuine installed Pi agent loop/writer: external message_end precedes exac
   const {DefaultResourceLoader}=await load('dist/core/resource-loader.js');
   const {Agent}=await sibling('pi-agent-core/dist/agent.js');
   const {AssistantMessageEventStream}=await sibling('pi-ai/dist/utils/event-stream.js');
-  const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'pi-a2a-real-loop-')));
+  const dir=fixtureRoot('pi-a2a-real-loop-');
   const originalFetch=globalThis.fetch;
   globalThis.fetch=()=>{throw Error('NETWORK FORBIDDEN by installed proof fixture');};
   let runtime, session;

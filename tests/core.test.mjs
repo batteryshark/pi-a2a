@@ -9,10 +9,11 @@ import { Runtime } from '../src/runtime.mjs';
 import { chiefTarget, loopback, OpenCode, messageID } from '../src/opencode.mjs';
 import { workerArgs } from '../src/worker.mjs';
 import { EventEmitter } from 'node:events';
+import { fixtureRoot } from './fixture.mjs';
 
 // All session IDs, messages, endpoints and auth strings in this suite are synthetic.
 const roots = [];
-function root() { const r = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pi-a2a-test-'))); roots.push(r); return r; }
+function root() { const r = fixtureRoot(); roots.push(r); return r; }
 test.after(() => { for (const r of roots) fs.rmSync(r, { recursive: true, force: true }); });
 const make = (dir, session, extra = {}) => { const messages = []; const r = new Runtime({ root: dir, session, cwd: dir, extension: path.resolve('index.ts'), sendMessage: (...args) => messages.push(args), ...extra }); r.messages = messages; return r; };
 function inbound(r) { r.message({ message: { role: 'custom', customType: 'pi-a2a-request', details: { request: r.active.id } } }); }
@@ -33,9 +34,11 @@ test('owner-only state, atomic admission/dedup and per-target serialization', ()
   assert.equal(Object.keys(store.read().requests).length, 1);
   assert.throws(() => store.tx(s => admit(s, { ...r, text: 'spoof' })));
   assert.throws(() => store.tx(s => admit(s, envelope('pi/c', 'pi/b', 'x'))));
-  assert.equal(fs.statSync(store.file).mode & 0o777, 0o600);
-  const link = path.join(dir, 'linked'); fs.symlinkSync(dir, link); assert.throws(() => new Store(link));
-  fs.chmodSync(store.file, 0o644); assert.throws(() => store.read());
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(store.file).mode & 0o777, 0o600);
+    const link = path.join(dir, 'linked'); fs.symlinkSync(dir, link); assert.throws(() => new Store(link));
+    fs.chmodSync(store.file, 0o644); assert.throws(() => store.read());
+  } // Windows counterparts are real ACL/junction negatives in test:windows.
 });
 test('transaction contention fails clearly without waiting or clobbering', () => {
   const store = new Store(root());
