@@ -46,7 +46,7 @@ test('installed Pi busy queue loss retries stable reply after restart; only save
   } finally { await a.close(); await b.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('genuine installed Pi agent loop/writer: external message_end precedes exact saved proof (synthetic stream, NO NETWORK)', { timeout:20000 }, async () => {
+test('genuine installed Pi agent loop/writer: external message_end precedes exact saved proof (synthetic stream, NO NETWORK)', { timeout:process.platform==='win32'?540000:20000 }, async () => {
   const installed=process.env.PI_A2A_PI_PACKAGE;
   assert.ok(installed && path.isAbsolute(installed));
   const load = file => import(pathToFileURL(path.join(installed,file)).href);

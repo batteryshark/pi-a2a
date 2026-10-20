@@ -7,7 +7,7 @@ $helper = Join-Path $PSScriptRoot '../src/windows-security.ps1'
 $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 function Call([string]$op,[string]$p,[int]$status=0) {
   $out = @{op=$op;path=$p} | ConvertTo-Json -Compress | & $ps -NoLogo -NoProfile -NonInteractive -File $helper
-  if ($LASTEXITCODE -ne $status) { throw 'helper result mismatch' }
+  if ($LASTEXITCODE -ne $status) { throw "helper result mismatch for $op (exit $LASTEXITCODE, expected $status)" }
   return ($out | ConvertFrom-Json)
 }
 [void](Call 'verifyRoot' $Root)

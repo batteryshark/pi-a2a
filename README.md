@@ -576,7 +576,16 @@ $env:PI_A2A_PI_ENTRY = 'C:\ReviewedPi\node_modules\@earendil-works\pi-coding-age
 ```
 
 `npm run test:windows` is the equivalent focused native command when PATH Node
-is supported. Use an outer 180-second watchdog per command. Native fixture
+is supported. Split native cases with `--test-name-pattern` and use an outer
+180-second watchdog per subset. The genuine installed-Pi loop is a separately
+bounded exception: its Windows test limit is 540 seconds (20 seconds on POSIX),
+with a recorded outer watchdog of at most 600 seconds. Do not assume the full
+portable suite fits a native proof window; each security check launches a helper.
+When using an allowlisted invocation environment, retain a vetted `PATHEXT`
+(for example `.COM;.EXE;.BAT;.CMD`) so PowerShell can execute native `.exe`
+pipeline commands. Keep NODE_OPTIONS/NODE_PATH unset and agent/config/TEMP/TMP
+under the owned protected fixture; do not inherit principal provider/auth data.
+Native fixture
 creation fails closed without `PI_A2A_TEST_PARENT`; all suite fixture roots use
 protected creation on Windows, never mkdtemp-then-ACL-repair. The POSIX chmod/
 symlink assertions are inapplicable there; native tests instead exercise real
