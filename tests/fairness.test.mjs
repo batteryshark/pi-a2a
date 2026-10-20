@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fixtureRoot } from './fixture.mjs';
+import { fixtureRoot, reconcileUntil } from './fixture.mjs';
 import { Runtime } from '../src/runtime.mjs';
 import { operate, claim, lookup, requestKey } from '../src/external.mjs';
 
@@ -58,13 +58,9 @@ test('terminal native active maintenance releases a no-candidate timeout but pre
   let now=100000;const real=Date.now;Date.now=()=>now;
   const f=fixture({now:()=>now});
   const sender=new Runtime({root:f.dir,session:'sender',cwd:f.dir,now:()=>now,sendMessage:()=>{}});sender.start();
-  const pump=async condition=>{
-    for(let i=0;i<8&&!condition();i++){await new Promise(r=>setTimeout(r,0));await f.r.reconcile();}
-    assert.ok(condition(),'native work progresses within eight normal passes');
-  };
   try {
     const first=await sender.send(f.r.self,'Synthetic hung native turn');
-    await pump(()=>f.r.active?.id===first.id);
+    await reconcileUntil(f.r,()=>f.r.active?.id===first.id,'first native dispatch');
     assert.equal(f.r.active.candidate,undefined);
     f.r.blocked(true);
     for(let i=0;i<3;i++)await f.r.reconcile();
@@ -72,10 +68,10 @@ test('terminal native active maintenance releases a no-candidate timeout but pre
     assert.equal(f.r.active.id,first.id,'absence of a candidate cannot clear a nonterminal blocked request');
     assert.equal(f.r.active.candidate,undefined);assert.equal(f.calls.length,1);
     now=f.r.store.read().requests[first.id].deadline+1;
-    await pump(()=>f.r.store.read().requests[first.id].status==='timeout'&&!f.r.active);
+    await reconcileUntil(f.r,()=>f.r.store.read().requests[first.id].status==='timeout'&&!f.r.active,'timeout persisted and terminal slot released');
     const second=await sender.send(f.r.self,'Synthetic next valid native turn');
     assert.ok(f.r.store.read().requests[second.id].deadline>now);
-    await pump(()=>f.r.active?.id===second.id);
+    await reconcileUntil(f.r,()=>f.r.active?.id===second.id,'second valid native dispatch');
     for(let i=0;i<3;i++)await f.r.reconcile();
     const rows=f.r.store.read().requests;
     assert.equal(rows[first.id].status,'timeout');assert.equal(rows[second.id].status,'queued');
@@ -167,7 +163,7 @@ test('unresolved OC outcome does not block heartbeat; late completion cannot bea
     try {
       const sent=await f.r.send('oc/ses_fixture','Synthetic outcome',{expectReply:false});
       f.r.store.tx(s=>{s.requests[sent.id].deadline=500000;});
-      await f.r.reconcile();assert.equal(calls,1);
+      await reconcileUntil(f.r,()=>calls===1,'initial OC outcome collection');assert.equal(calls,1);
       now+=30000;await f.r.reconcile();assert.equal(calls,1);
       const hb=f.r.store.read().sessions[f.r.self].heartbeat;assert.equal(hb,now);
       if(replace)f.r.store.tx(s=>{s.sessions[f.r.self].epoch='replacement';});
@@ -197,7 +193,7 @@ test('deadline fixture joining a pre-clock-change snapshot requires a fresh norm
     assert.equal(f.r.reconcile(),existing,'call joins snapshot preceding admission and clock change');
     release();await existing;
     assert.equal(f.r.store.read().requests.stable.status,'sent');assert.equal(f.r.moreWork,true);
-    for(let i=0;i<8&&f.r.store.read().requests.stable.status!=='timeout';i++){await new Promise(r=>setTimeout(r,0));await f.r.reconcile();}
+    await reconcileUntil(f.r,()=>f.r.store.read().requests.stable.status==='timeout','fresh deadline pass persists timeout');
     assert.equal(f.r.store.read().requests.stable.status,'timeout');
     assert.equal(sends,1,'normal timeout reconciliation never replays external admission');
     assert.equal(outcomes,0,'expired work is not collected as completed');
@@ -206,10 +202,10 @@ test('deadline fixture joining a pre-clock-change snapshot requires a fresh norm
 test('compacted claim persists facade/event facts without treating either as saved consumption',async()=>{
   const f=fixture();
   try {
-    operate(f.r.store,send());await f.r.reconcile();
+    operate(f.r.store,send());await reconcileUntil(f.r,()=>f.r.store.read().external[requestKey(send())].injected===true,'compacted claim persists injection fact');
     let row=f.r.store.read().external[requestKey(send())];
     assert.equal(row.epoch,undefined);assert.equal(row.injected,true);assert.equal(row.proof,undefined);
-    f.r.message({type:'message_end',message:{role:'custom',...f.calls[0]}});await f.r.reconcile();
+    f.r.message({type:'message_end',message:{role:'custom',...f.calls[0]}});await reconcileUntil(f.r,()=>f.r.store.read().external[requestKey(send())].observed===true,'compacted claim persists observed event');
     row=f.r.store.read().external[requestKey(send())];assert.equal(row.observed,true);assert.equal(row.proof,undefined);
   } finally {await f.close();}
 });

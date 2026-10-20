@@ -1,5 +1,5 @@
 import test from 'node:test';
-import { fixtureRoot } from './fixture.mjs';
+import { fixtureRoot, reconcileUntil } from './fixture.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -62,7 +62,7 @@ test('unknown cancellation tombstone survives restart, delays and capacity witho
 
 test('oversize discard crosses windows/restart/partial EOF, stays bounded and resumes exact proof', {timeout:20000}, async()=>{
   const f=setup(); try {
-    operate(f.store,send()); await f.r.reconcile(); const m=f.calls[0][0];
+    operate(f.store,send()); await reconcileUntil(f.r,()=>f.calls.length===1,'external facade before partial oversize proof'); const m=f.calls[0][0];
     // Stop automatic scans to measure exactly one window per explicit call.
     await f.r.close();
     fs.appendFileSync(f.file,'x'.repeat(3*262144+71));
@@ -82,7 +82,7 @@ test('oversize discard crosses windows/restart/partial EOF, stays bounded and re
 
 test('completed multi-window oversize before exact wake never skips the later record', async()=>{
   const f=setup(); try {
-    operate(f.store,send()); await f.r.reconcile(); const m=f.calls[0][0]; await f.r.close();
+    operate(f.store,send()); await reconcileUntil(f.r,()=>f.calls.length===1,'external facade before completed oversize proof'); const m=f.calls[0][0]; await f.r.close();
     fs.appendFileSync(f.file,'x'.repeat(4*262144+3)+'\nnull\n'+JSON.stringify({type:'custom_message',id:'after-completed-oversize',...m})+'\n');
     for(let i=0;i<4;i++) {
       const rec=operate(new Store(f.dir),query('status'));
@@ -125,7 +125,7 @@ test('near native byte ceiling permits external admission, claim, cursor/proof a
       const size=Buffer.byteLength(JSON.stringify({sessions:s.sessions,requests:s.requests,creates:s.creates}));
       s.creates.padding='x'.repeat(NATIVE_BYTES-size-150);
     });
-    operate(f.store,send()); await f.r.reconcile();
+    operate(f.store,send()); await reconcileUntil(f.r,()=>f.calls.length===1&&f.store.read().requests.native.status==='timeout','external facade and native timeout near byte ceiling');
     assert.equal(f.store.read().requests.native.status,'timeout');
     fs.appendFileSync(f.file,'x'.repeat(600000));
     assert.equal(operate(f.store,query('status')).evidence,'oversized_record');
@@ -181,7 +181,7 @@ test('50,000 realistic permanent compact identities retain lookup/conflict/cance
     sender.start(); peer.start();
     const pi=await sender.send(peer.self,'Synthetic native admission',{id:'retained-native',expectReply:false});
     assert.equal(pi.status,'admitted');
-    await peer.reconcile();
+    await reconcileUntil(peer,()=>delivered.length===1,'native dispatch with retained identities');
     assert.equal(delivered.length,1); assert.equal(delivered[0].details.request,pi.id);
     const oc=await sender.send('oc/ses_fixture','Synthetic fake OC admission',{id:'retained-oc',expectReply:false});
     assert.equal(oc.status,'sent'); assert.equal(ocCalls,1);
@@ -296,7 +296,7 @@ test('multiple external queue/steer wakes bypass active native work and never be
     f.r.active={id:'native',focus:true};
     f.store.tx(s=>{s.requests.native={id:'native',from:'pi/sender',to:'pi/target',status:'queued',injected:true,expectReply:true,deadline:Date.now()+60000};});
     for(let i=0;i<3;i++) operate(f.store,send(`q${i}`,{delivery:i===2?'steer':'queue'}));
-    await f.r.reconcile(); await f.r.reconcile();
+    await reconcileUntil(f.r,()=>f.calls.length===3,'all queue/steer external facades');
     assert.equal(f.calls.length,3); assert.deepEqual(f.calls.map(c=>c[1].deliverAs),['followUp','followUp','steer']);
     f.r.message({type:'message_start',message:{role:'custom',...f.calls[0][0]}}); assert.equal(f.r.active.focus,false);
     assert.deepEqual(Object.keys(f.store.read().requests),['native']);
@@ -304,7 +304,7 @@ test('multiple external queue/steer wakes bypass active native work and never be
 });
 test('no event/facade ack proves consumption; exact complete saved entry, session header and proof persistence required', async () => {
   const f=setup(); try {
-    operate(f.store,send()); await f.r.reconcile(); const m=f.calls[0][0];
+    operate(f.store,send()); await reconcileUntil(f.r,()=>f.calls.length===1,'external facade before event-versus-proof check'); const m=f.calls[0][0];
     f.r.message({type:'message_end',message:{role:'custom',...m}}); await f.r.reconcile();
     assert.equal(operate(f.store,query('status')).facts.consumed,false);
     const line=JSON.stringify({type:'custom_message',id:'entry',...m}); fs.appendFileSync(f.file,line);
@@ -344,7 +344,7 @@ test('old state is rejected, never migrated or modified',()=>{
 
 test('proof rejects wrong tokens/digests/content and oversized records; saved proof survives receipt commit failure', async()=>{
   const f=setup(); try {
-    operate(f.store,send()); await f.r.reconcile(); const m=f.calls[0][0];
+    operate(f.store,send()); await reconcileUntil(f.r,()=>f.calls.length===1,'external facade before invalid proof checks'); const m=f.calls[0][0];
     const append=x=>fs.appendFileSync(f.file,JSON.stringify({type:'custom_message',id:'fixture-entry',...x})+'\n');
     append({...m,details:{...m.details,claim:'wrong'}});
     append({...m,details:{...m.details,digest:'wrong'}});
@@ -358,15 +358,15 @@ test('proof rejects wrong tokens/digests/content and oversized records; saved pr
     f.store.tx=original;
     assert.equal(operate(f.store,query('status')).state,'consumed');
     const escaped=send('escaped',{text:'\u0000'.repeat(32767)+'x'});
-    operate(f.store,escaped); await f.r.reconcile();
+    operate(f.store,escaped); await reconcileUntil(f.r,()=>f.calls.length===2,'escaped-payload external facade');
     append(f.calls.at(-1)[0]);
     assert.equal(operate(f.store,query('status','escaped')).state,'consumed');
-    operate(f.store,send('unicode',{text:'replacement \ufffd'})); await f.r.reconcile();
+    operate(f.store,send('unicode',{text:'replacement \ufffd'})); await reconcileUntil(f.r,()=>f.calls.length===3,'unicode-payload external facade');
     const unicode=f.calls.at(-1)[0];
     append({...unicode,content:unicode.content.replace('\ufffd','\ud800')});
     assert.equal(operate(f.store,query('status','unicode')).facts.consumed,false);
     append(unicode); assert.equal(operate(f.store,query('status','unicode')).state,'consumed');
-    operate(f.store,send('oversized')); await f.r.reconcile();
+    operate(f.store,send('oversized')); await reconcileUntil(f.r,()=>f.calls.length===4,'external facade before oversized-record check');
     fs.appendFileSync(f.file,'x'.repeat(262145));
     // Completed earlier proofs may have released the cursor; allow their one
     // bounded rescan window before the oversized tail is reached.

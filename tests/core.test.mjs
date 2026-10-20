@@ -9,7 +9,7 @@ import { Runtime } from '../src/runtime.mjs';
 import { chiefTarget, loopback, OpenCode, messageID } from '../src/opencode.mjs';
 import { workerArgs } from '../src/worker.mjs';
 import { EventEmitter } from 'node:events';
-import { fixtureRoot } from './fixture.mjs';
+import { fixtureRoot, reconcileUntil } from './fixture.mjs';
 
 // All session IDs, messages, endpoints and auth strings in this suite are synthetic.
 const roots = [];
@@ -50,13 +50,13 @@ test('idle request auto wake, busy followUp, true settled correlation and reply 
   try {
     const sent = await a.send('pi/b', 'Do a task');
     assert.equal(a.store.read().requests[sent.id].status, 'admitted');
-    await b.reconcile();
+    await reconcileUntil(b,()=>b.active?.id===sent.id,'receiver dispatches original request');
     assert.deepEqual(b.messages[0][1], { triggerTurn: true, deliverAs: 'followUp' });
     answer(b, 'unrelated busy-turn output'); b.settled();
     assert.equal(b.store.read().requests[sent.id].status, 'queued');
     inbound(b); answer(b, 'intermediate'); // agent_end is deliberately not an integration hook
     assert.equal(b.store.read().requests[sent.id].status, 'queued');
-    answer(b, 'final'); b.beforeSettle({ outcome: 'completed' }); b.settled(); await a.reconcile();
+    answer(b, 'final'); b.beforeSettle({ outcome: 'completed' }); b.settled(); await reconcileUntil(a,()=>hasReply(a,sent.id),'sender queues final reply');
     assert.equal(a.messages.length, 1); assert.match(a.messages[0][0].content, /final/);
     assert.equal(a.messages[0][1].triggerTurn, true);
     await a.reconcile(); assert.equal(a.messages.length, 1);
@@ -67,7 +67,7 @@ test('steer delivery, error and abort outcomes remain request specific', async (
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'); a.start(); b.start();
   try {
     for (const status of ['error', 'abort']) {
-      const r = await a.send('pi/b', status, { delivery: 'steer' }); await b.reconcile();
+      const r = await a.send('pi/b', status, { delivery: 'steer' }); await reconcileUntil(b,()=>b.active?.id===r.id,`receiver dispatches ${status} request`);
       assert.equal(b.messages.at(-1)[1].deliverAs, 'steer'); inbound(b);
       answer(b, status, status === 'abort' ? 'aborted' : 'error');
       b.beforeSettle({ outcome: status === 'abort' ? 'aborted' : 'error' }); b.settled();
@@ -78,18 +78,18 @@ test('steer delivery, error and abort outcomes remain request specific', async (
 test('offline rejection, persisted reply while owner offline, recovery without replay', async () => {
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'); a.start(); b.start();
   await assert.rejects(a.send('pi/missing', 'x'), /offline/);
-  const r = await a.send('pi/b', 'x'); await a.close(); await b.reconcile(); inbound(b); answer(b, 'durable'); b.settled();
-  const resumed = make(dir, 'a'); resumed.start(); await resumed.reconcile();
+  const r = await a.send('pi/b', 'x'); await a.close(); await reconcileUntil(b,()=>b.active?.id===r.id,'receiver dispatches while sender offline'); inbound(b); answer(b, 'durable'); b.settled();
+  const resumed = make(dir, 'a'); resumed.start(); await reconcileUntil(resumed,()=>hasReply(resumed,r.id),'resumed Runtime queues durable reply');
   assert.match(resumed.messages[0][0].content, /durable/);
    assert.equal(resumed.store.read().requests[r.id].notified, false); // enqueue is not consumption
   await resumed.close(); await b.close();
 });
 test('reload of injected turn blocks instead of duplicate model execution; timeout releases pending', async () => {
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'); a.start(); b.start();
-  const sent = await a.send('pi/b', 'x'); await b.reconcile(); await b.close();
+  const sent = await a.send('pi/b', 'x'); await reconcileUntil(b,()=>b.active?.id===sent.id,'receiver injects before reconstruction'); await b.close();
   const resumed = make(dir, 'b'); resumed.start(); await resumed.reconcile();
   assert.equal(resumed.messages.length, 0); assert.equal(a.store.read().requests[sent.id].status, 'blocked');
-  a.now = () => Date.now() + 200000; await a.reconcile();
+  a.now = () => Date.now() + 200000; await reconcileUntil(a,()=>a.store.read().requests[sent.id].status==='timeout','expired reloaded request times out');
   assert.equal(a.store.read().requests[sent.id].status, 'timeout');
   await resumed.close(); await a.close();
 });
@@ -170,12 +170,12 @@ test('blocked UI is nonterminal; dedup does not repeat OpenCode effect; expired 
   const oc = { url: 'http://127.0.0.1:1', async send() { sends++; }, async events() {}, async outcome() { return { status: 'completed', answer: 'too late' }; } };
   const a = make(dir, 'a', { oc }), b = make(dir, 'b'); a.start(); b.start();
   try {
-    const r = await a.send('pi/b', 'x'); await b.reconcile(); b.blocked(true);
+    const r = await a.send('pi/b', 'x'); await reconcileUntil(b,()=>b.active?.id===r.id,'receiver dispatches before UI block'); b.blocked(true);
     assert.equal(a.store.read().requests[r.id].status, 'blocked'); b.blocked(false);
     assert.equal(a.store.read().requests[r.id].status, 'queued');
     const opts = { id: 'stable' }; await a.send('oc/ses_fake_test', 'x', opts); await a.send('oc/ses_fake_test', 'x', opts);
     assert.equal(sends, 1); a.now = () => Date.now() + 200000;
-    await reconcileUntil(a,()=>a.store.read().requests.stable.status==='timeout');
+    await reconcileUntil(a,()=>a.store.read().requests.stable.status==='timeout','expired OC request times out');
     assert.equal(a.store.read().requests.stable.status, 'timeout');
     assert.equal(sends, 1,'deadline reconciliation never repeats the external send');
   } finally { await b.close(); await a.close(); }
@@ -183,13 +183,13 @@ test('blocked UI is nonterminal; dedup does not repeat OpenCode effect; expired 
 test('inbound logical request stays open across detached nested reply; no interim final', async () => {
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'), c = make(dir, 'c'); a.start(); b.start(); c.start();
   try {
-    const original = await a.send('pi/b', 'delegate'); await b.reconcile(); inbound(b);
+    const original = await a.send('pi/b', 'delegate'); await reconcileUntil(b,()=>b.active?.id===original.id,'parent dispatch'); inbound(b);
     const nested = await b.send('pi/c', 'compute'); answer(b, 'interim delegation'); b.settled();
     assert.equal(a.store.read().requests[original.id].status, 'blocked');
     await a.reconcile(); assert.equal(a.messages.length, 0);
-    await c.reconcile(); inbound(c); answer(c, 'nested answer'); c.settled();
-    await b.reconcile(); assert.equal(b.store.read().requests[nested.id].notified, false); reply(b, nested.id);
-    answer(b, 'synthesized final'); b.settled(); await a.reconcile();
+    await reconcileUntil(c,()=>c.active?.id===nested.id,'nested child dispatch'); inbound(c); answer(c, 'nested answer'); c.settled();
+    await reconcileUntil(b,()=>hasReply(b,nested.id),'nested return queued'); assert.equal(b.store.read().requests[nested.id].notified, false); reply(b, nested.id);
+    answer(b, 'synthesized final'); b.settled(); await reconcileUntil(a,()=>hasReply(a,original.id),'synthesized final queued');
     assert.match(a.messages[0][0].content, /synthesized final/);
   } finally { await c.close(); await b.close(); await a.close(); }
 });
@@ -197,10 +197,10 @@ test('inbound logical request stays open across detached nested reply; no interi
 for (const earlyInjection of [false, true]) test(`terminal child before parent settlement; early injection=${earlyInjection}`, async () => {
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'), c = make(dir, 'c'); a.start(); b.start(); c.start();
   try {
-    const original = await a.send('pi/b', 'delegate'); await b.reconcile(); inbound(b);
+    const original = await a.send('pi/b', 'delegate'); await reconcileUntil(b,()=>b.active?.id===original.id,'parent dispatch before early return'); inbound(b);
     const child = await b.send('pi/c', 'compute'); answer(b, 'INTERIM');
-    await c.reconcile(); inbound(c); answer(c, 'child'); c.settled();
-    if (earlyInjection) { await b.reconcile(); reply(b, child.id); }
+    await reconcileUntil(c,()=>c.active?.id===child.id,'early-return child dispatch'); inbound(c); answer(c, 'child'); c.settled();
+    if (earlyInjection) { await reconcileUntil(b,()=>hasReply(b,child.id),'early correlated reply queued'); reply(b, child.id); }
     b.settled();
     assert.equal(a.store.read().requests[original.id].status, 'blocked');
     b.message({ message: { role: 'user', content: 'unrelated human turn' } }); answer(b, 'UNRELATED'); b.settled();
@@ -209,7 +209,7 @@ for (const earlyInjection of [false, true]) test(`terminal child before parent s
       // Already consumed, but interrupted before synthesis: never guess a final.
       assert.equal(b.active.answer, ''); return;
     }
-    await b.reconcile(); reply(b, child.id); answer(b, 'SYNTHESIS'); b.settled();
+    await reconcileUntil(b,()=>hasReply(b,child.id),'late correlated reply queued'); reply(b, child.id); answer(b, 'SYNTHESIS'); b.settled();
     assert.equal(a.store.read().requests[original.id].answer, 'SYNTHESIS');
   } finally { await c.close(); await b.close(); await a.close(); }
 });
@@ -217,35 +217,29 @@ for (const earlyInjection of [false, true]) test(`terminal child before parent s
 test('reply before original settlement can synthesize, and duplicate end event does not erase synthesis', async () => {
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'), c = make(dir, 'c'); a.start(); b.start(); c.start();
   try {
-    const original = await a.send('pi/b', 'delegate'); await b.reconcile(); inbound(b);
+    const original = await a.send('pi/b', 'delegate'); await reconcileUntil(b,()=>b.active?.id===original.id,'parent dispatch before duplicate-event test'); inbound(b);
     const child = await b.send('pi/c', 'compute'); answer(b, 'INTERIM');
-    await c.reconcile(); inbound(c); answer(c, 'child'); c.settled(); await b.reconcile();
+    await reconcileUntil(c,()=>c.active?.id===child.id,'duplicate-event child dispatch'); inbound(c); answer(c, 'child'); c.settled(); await reconcileUntil(b,()=>hasReply(b,child.id),'reply before parent settlement queued');
     const m = reply(b, child.id); answer(b, 'SYNTHESIS');
     b.message({ type: 'message_end', message: { role: 'custom', ...m } }); b.settled();
     assert.equal(a.store.read().requests[original.id].answer, 'SYNTHESIS');
   } finally { await c.close(); await b.close(); await a.close(); }
 });
 
-// A reconcile call may join an already-running pass with an older snapshot.
-// Wait for the actual normal queue/active condition, not an arbitrary one pass.
-async function reconcileUntil(r, condition) {
-  for (let i=0;i<8&&!condition();i++) {await new Promise(resolve=>setTimeout(resolve,0));await r.reconcile();}
-  assert.ok(condition(),'expected queue/active state within eight normal reconciliation passes');
-}
 const hasReply=(r,id)=>r.messages.some(([m])=>m.details?.replyId===`${id}-reply`);
 for (const controlled of [false,true]) test(`three-level nested return requires synthesis at every ancestor in adverse order${controlled?' with a shared pre-settlement snapshot':''}`, async () => {
   const dir = root(), peers = ['a', 'b', 'c', 'd'].map(id => make(dir, id)); const [a, b, c, d] = peers;
   let release=()=>{};
   for (const r of peers) r.start();
   try {
-    const ab = await a.send('pi/b', 'delegate'); await reconcileUntil(b,()=>b.active?.id===ab.id); inbound(b);
+    const ab = await a.send('pi/b', 'delegate'); await reconcileUntil(b,()=>b.active?.id===ab.id,'three-level parent dispatch'); inbound(b);
     const bc = await b.send('pi/c', 'delegate'); answer(b, 'B INTERIM');
     const sibling = await b.send('pi/d', 'sibling');
-    await reconcileUntil(d,()=>d.active?.id===sibling.id); inbound(d); answer(d, 'sibling answer'); d.settled(); await reconcileUntil(b,()=>hasReply(b,sibling.id)); reply(b, sibling.id);
+    await reconcileUntil(d,()=>d.active?.id===sibling.id,'sibling dispatch'); inbound(d); answer(d, 'sibling answer'); d.settled(); await reconcileUntil(b,()=>hasReply(b,sibling.id),'sibling reply queued'); reply(b, sibling.id);
     answer(b, 'still interim'); b.settled();
     assert.equal(a.store.read().requests[ab.id].status, 'blocked');
-    await reconcileUntil(c,()=>c.active?.id===bc.id); inbound(c); const cd = await c.send('pi/d', 'deep'); answer(c, 'C INTERIM');
-    await reconcileUntil(d,()=>d.active?.id===cd.id); inbound(d); answer(d, 'deep answer'); d.settled();
+    await reconcileUntil(c,()=>c.active?.id===bc.id,'middle child dispatch'); inbound(c); const cd = await c.send('pi/d', 'deep'); answer(c, 'C INTERIM');
+    await reconcileUntil(d,()=>d.active?.id===cd.id,'deep child dispatch'); inbound(d); answer(d, 'deep answer'); d.settled();
     c.settled(); assert.equal(a.store.read().requests[bc.id].status, 'blocked');
     let existing;
     if (controlled) {
@@ -258,7 +252,7 @@ for (const controlled of [false,true]) test(`three-level nested return requires 
       await Promise.race([snapshot,existing.then(()=>{throw Error('pass ended before controlled snapshot gate');})]);
       assert.equal(a.store.read().requests[bc.id].status,'blocked');
     }
-    await reconcileUntil(c,()=>hasReply(c,cd.id)); reply(c, cd.id); answer(c, 'C SYNTHESIS'); c.settled();
+    await reconcileUntil(c,()=>hasReply(c,cd.id),'deep child reply queued'); reply(c, cd.id); answer(c, 'C SYNTHESIS'); c.settled();
     assert.equal(a.store.read().requests[bc.id].answer, 'C SYNTHESIS');
     answer(b, 'UNRELATED'); b.settled(); assert.equal(a.store.read().requests[ab.id].status, 'blocked');
     if (controlled) {
@@ -267,7 +261,7 @@ for (const controlled of [false,true]) test(`three-level nested return requires 
       assert.equal(hasReply(b,bc.id),false,'old snapshot cannot enqueue a newly settled return');
       assert.equal(b.moreWork,true,'final snapshot schedules the missing return');
     }
-    await reconcileUntil(b,()=>hasReply(b,bc.id)); reply(b, bc.id); answer(b, 'B SYNTHESIS'); b.settled();
+    await reconcileUntil(b,()=>hasReply(b,bc.id),'middle synthesis reply queued'); reply(b, bc.id); answer(b, 'B SYNTHESIS'); b.settled();
     assert.equal(a.store.read().requests[ab.id].answer, 'B SYNTHESIS');
     for (const [r,id] of [[b,sibling.id],[c,cd.id],[b,bc.id]]) assert.equal(r.messages.filter(([m])=>m.details?.replyId===`${id}-reply`).length,1,'exactly one queued correlated reply');
   } finally { release();for (const r of peers.reverse()) await r.close(); }
@@ -277,7 +271,7 @@ test('independent outgoing request cannot hold or resolve an inbound request', a
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'), c = make(dir, 'c'); a.start(); b.start(); c.start();
   try {
     const independent = await b.send('pi/c', 'independent');
-    const original = await a.send('pi/b', 'direct'); await b.reconcile(); inbound(b); answer(b, 'DIRECT'); b.settled();
+    const original = await a.send('pi/b', 'direct'); await reconcileUntil(b,()=>b.active?.id===original.id,'independent-return parent dispatch'); inbound(b); answer(b, 'DIRECT'); b.settled();
     assert.equal(a.store.read().requests[original.id].answer, 'DIRECT');
     assert.equal(a.store.read().requests[independent.id].parentRequest, undefined);
   } finally { await c.close(); await b.close(); await a.close(); }
@@ -288,7 +282,7 @@ test('final candidate and UI hook survive real cross-process root lock release w
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'); a.start(); b.start();
   let child;
   try {
-    const original = await a.send('pi/b', 'answer'); await b.reconcile(); inbound(b); answer(b, 'FINAL');
+    const original = await a.send('pi/b', 'answer'); await reconcileUntil(b,()=>b.active?.id===original.id,'candidate dispatch before cross-process lock'); inbound(b); answer(b, 'FINAL');
     const storeURL = new URL('../src/store.mjs', import.meta.url).href;
     child = spawn(process.execPath, ['--input-type=module', '-e', `import {Store} from ${JSON.stringify(storeURL)}; new Store(${JSON.stringify(dir)}).tx(() => { process.stdout.write('locked'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,250); });`], { stdio: ['ignore', 'pipe', 'pipe'] });
     const exited = new Promise((resolve, reject) => { child.once('exit', code => code === 0 ? resolve() : reject(Error(`lock child ${code}`))); child.once('error', reject); });
@@ -309,7 +303,7 @@ test('final candidate and UI hook survive real cross-process root lock release w
 test('completion retry budget retains candidate, fails closed, and deadline releases active slot', async () => {
   const dir = root(), a = make(dir, 'a'), b = make(dir, 'b'); a.start(); b.start();
   try {
-    const original = await a.send('pi/b', 'x'); await b.reconcile(); inbound(b); answer(b, 'FINAL');
+    const original = await a.send('pi/b', 'x'); await reconcileUntil(b,()=>b.active?.id===original.id,'candidate dispatch before retry-budget test'); inbound(b); answer(b, 'FINAL');
     b.store.tx(() => { for (let i = 0; i < 40; i++) b.settled(); });
     assert.equal(b.active.candidateAttempts, 32); assert.equal(b.active.candidate.answer, 'FINAL');
     await b.reconcile(); assert.notEqual(a.store.read().requests[original.id].status, 'completed');

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { Runtime } from '../src/runtime.mjs';
 import { operate, requestKey } from '../src/external.mjs';
-import { fixtureRoot } from './fixture.mjs';
+import { fixtureRoot, reconcileUntil } from './fixture.mjs';
 import { setTimeout as timerTurn } from 'node:timers/promises';
 
 function cleanupFixture(dir, passed) {
@@ -16,7 +16,8 @@ function cleanupFixture(dir, passed) {
 
 // Optional host-contract regression; all IDs/messages are synthetic.
 // Point at an already installed Pi package, never a fixed release location.
-test('installed Pi busy queue loss retries stable reply after restart; only saved transcript acknowledges', async () => {
+// Runtime reconstruction below is in ONE Node process, not an OS/native restart.
+for (const controlled of [false,true]) test(`installed Pi busy queue loss retries stable reply after same-process Runtime reconstruction; only saved transcript acknowledges${controlled?' with controlled old snapshots':''}`, async () => {
   const installed = process.env.PI_A2A_PI_PACKAGE;
   assert.ok(installed && path.isAbsolute(installed), 'Set PI_A2A_PI_PACKAGE to the absolute installed pi-coding-agent package directory');
   const { AgentSession } = await import(pathToFileURL(path.join(installed, 'dist/core/agent-session.js')).href);
@@ -26,34 +27,75 @@ test('installed Pi busy queue loss retries stable reply after restart; only save
   manager.appendMessage({ role: 'user', content: 'zero-model persistence fixture', timestamp: Date.now() });
   const queue = [], adapter = { isStreaming: true, agent: { followUp: m => queue.push(m) } };
   const sendMessage = (m, o) => { void AgentSession.prototype.sendCustomMessage.call(adapter, m, o); };
-  const make = (session, deliver = sendMessage) => new Runtime({ root: dir, session, cwd: dir,
-    extension: fileURLToPath(new URL('../index.ts', import.meta.url)), sendMessage: deliver,
-    transcript: () => manager.getSessionFile() });
-  let passed=false;
+  const runtimes=[];
+  const make = (session, deliver = sendMessage) => {
+    const r=new Runtime({ root: dir, session, cwd: dir,
+      extension: fileURLToPath(new URL('../index.ts', import.meta.url)), sendMessage: deliver,
+      transcript: () => manager.getSessionFile() });runtimes.push(r);return r;
+  };
+  // Only pause after an actual timer turn, outside Store locks. The shared
+  // progress helper must NOT erase these exact old-pass assertions.
+  function gateAfterTurn(r,n) {
+    const turn=r.turn.bind(r);let count=0,ready,release;
+    const reached=new Promise(resolve=>{ready=resolve;}),gate=new Promise(resolve=>{release=resolve;});
+    r.turn=async()=>{const result=await turn();if(++count===n){ready();await gate;}return result;};
+    const existing=r.reconcile();
+    return {existing,held:Promise.race([reached,existing.then(()=>{throw Error('pass ended before controlled real turn');})]),release,restore:()=>{r.turn=turn;}};
+  }
+  const originalFetch=globalThis.fetch;
+  globalThis.fetch=()=>{throw Error('NETWORK FORBIDDEN by installed reconstruction fixture');};
+  let passed=false,gate;
   let a = make('fake_sender'); const b = make('fake_receiver', () => {}); a.start(); b.start();
   try {
-    const original = await a.send('pi/fake_receiver', 'synthetic task'); await b.reconcile();
+    const original = await a.send('pi/fake_receiver', 'synthetic task'); await reconcileUntil(b,()=>b.active?.id===original.id,'installed receiver dispatch');
     b.message({ message: { role: 'custom', customType: 'pi-a2a-request', details: { request: b.active.id } } });
     b.message({ message: { role: 'assistant', content: [{ type: 'text', text: 'synthetic answer' }], stopReason: 'stop' } });
-    b.settled(); await a.reconcile();
+    if(controlled) {
+      await a.reconcile();gate=gateAfterTurn(a,2);await gate.held;
+      assert.equal(a.store.read().requests[original.id].status,'queued');assert.equal(queue.length,0);
+    }
+    b.settled();
+    if(controlled) {
+      assert.equal(a.reconcile(),gate.existing,'post-settlement caller joins pre-settlement pass');
+      gate.release();await gate.existing;gate.restore();gate=null;
+      assert.equal(queue.length,0,'old snapshot omits the newly settled reply');
+      assert.equal(a.store.read().requests[original.id].notified,false);assert.equal(a.moreWork,true);
+    }
+    await reconcileUntil(a,()=>queue.some(m=>m.details?.replyId===`${original.id}-reply`),'installed correlated reply queued');
     assert.equal(queue.length, 1); assert.equal(a.store.read().requests[original.id].notified, false);
-    await a.reconcile(); assert.equal(queue.length, 1);
+    assert.equal(queue[0].details.replyId,`${original.id}-reply`);
+    await timerTurn(0);await a.reconcile(); assert.equal(queue.length, 1);
     const stable = queue.pop(); await a.close();
-    a = make('fake_sender'); a.start(); await a.reconcile();
+    a = make('fake_sender'); a.start(); await reconcileUntil(a,()=>queue.some(m=>m.details?.replyId===stable.details.replyId),'reconstructed Runtime queues same stable reply');
     assert.equal(queue.length, 1); assert.equal(queue[0].details.replyId, stable.details.replyId);
+    assert.equal(a.store.read().requests[original.id].notified,false);
     const m = queue.pop(); a.message({ type: 'message_start', message: m });
-    a.message({ type: 'message_end', message: m }); await a.reconcile();
+    a.message({ type: 'message_end', message: m }); await timerTurn(0);await a.reconcile();
     assert.equal(a.store.read().requests[original.id].notified, false);
+    assert.equal(queue.length,0);
+    assert.equal(fs.readFileSync(manager.getSessionFile(),'utf8').includes(stable.details.replyId),false);
+    if(controlled) {await a.reconcile();gate=gateAfterTurn(a,3);await gate.held;}
     manager.appendCustomMessageEntry(m.customType, m.content, m.display, m.details);
-    await a.reconcile(); assert.equal(a.store.read().requests[original.id].notified, true);
-    await a.close(); a = make('fake_sender'); a.start(); await a.reconcile();
+    if(controlled) {
+      const saved=fs.readFileSync(manager.getSessionFile(),'utf8').split('\n').filter(Boolean).map(JSON.parse);
+      assert.equal(saved.filter(e=>e.type==='custom_message'&&e.details?.replyId===stable.details.replyId).length,1);
+      assert.equal(a.reconcile(),gate.existing,'post-append caller joins pre-append consumed-set pass');
+      gate.release();await gate.existing;gate.restore();gate=null;
+      assert.equal(a.store.read().requests[original.id].notified,false,'old consumed snapshot cannot acknowledge the later saved entry');
+      assert.equal(queue.length,0);
+    }
+    await reconcileUntil(a,()=>a.store.read().requests[original.id].notified===true,'real SessionManager append acknowledged'); assert.equal(a.store.read().requests[original.id].notified, true);
+    await a.close(); a = make('fake_sender'); a.start(); await timerTurn(0);await a.reconcile();
     assert.equal(queue.length, 0);
-    a.update(original.id, { notified: false }); await a.reconcile(); assert.equal(queue.length, 0);
+    a.update(original.id, { notified: false }); await reconcileUntil(a,()=>a.store.read().requests[original.id].notified===true,'saved proof restores explicitly reset receipt'); assert.equal(queue.length, 0);
     assert.equal(a.store.read().requests[original.id].notified, true);
     passed=true;
   } finally {
-    try {await a.close();await b.close();} catch(e) {passed=false;throw e;}
-    finally {cleanupFixture(dir,passed);}
+    gate?.release();
+    try {
+      for(const r of runtimes.reverse()) {await r.close();assert.equal(r.turns.size,0);assert.equal(r.children.size,0);assert.equal(r.reconciling,null);}
+    } catch(e) {passed=false;throw e;}
+    finally {globalThis.fetch=originalFetch;cleanupFixture(dir,passed);}
   }
 });
 
