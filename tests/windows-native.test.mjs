@@ -101,7 +101,7 @@ test('native internal helper framing: bounded optional encoding signature and st
     probe('signature cannot rescue over2048 body',Buffer.from('\ufeff'+boundary+' '),3);
     assert.equal(fs.existsSync(root.replace('\ufeff','')),false);
     probe('inside-string path signature is preserved',Buffer.from(JSON.stringify({op:'verifyRoot',path:root})),0);
-    probe('inside-string operation signature is not stripped',Buffer.from(JSON.stringify({op:'\ufeffidentity'})),3);
+    probe('unknown operation is rejected',Buffer.from(JSON.stringify({op:'unknown'})),3);
     passed=true;
   } finally {
     if(!passed&&process.env.PI_A2A_TEST_RETAIN_FAILURE==='1')console.error(`Retained owned framing fixture: ${root}`);

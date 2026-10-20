@@ -76,6 +76,7 @@ test('internal helper strips one initial decoded signature after raw bound; exte
   assert.equal(ps.split('$inputText = $inputText.Substring(1)').length-1,1);
   assert.ok(!ps.includes('TrimStart'));
   for(const prefix of ['\ufeff','\ufeff\ufeff',' \ufeff'])assert.throws(()=>parse(Buffer.from(prefix+'{"v":1,"op":"capabilities"}')),{code:'INVALID_JSON'});
+  assert.throws(()=>frame({v:1,op:'\ufeffcapabilities'}),{code:'SCHEMA'});
   assert.equal(frame({v:1,op:'send',caller:'fixture',id:'signature-data',to:'pi/fixture',text:'a\ufeffb',delivery:'queue',expectReply:false}).text,'a\ufeffb');
 });
 test('native Node plus Pi JS entry uses separate argv, package metadata, minimum version (MOCK)',()=>{
