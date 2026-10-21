@@ -18,8 +18,9 @@ is a 320×320 alpha-aware resampled derivative, not a separately designed tiny i
 ## Requirements and setup
 
 Use **Pi 1.0.4** and **Node 22.19.0+**. Other Pi versions need
-verification. Native Windows storage/launch is a **candidate, unproven until
-native proof**; portable mocks do not establish Windows acceptance. Unsupported
+verification. Native Windows has bounded host evidence for secure storage,
+launch checks and machine-companion queue/busy-steer saved intake under the policy
+below—not universal Windows compatibility or a latency guarantee. Unsupported
 security configurations fail closed with `UNSUPPORTED_SECURITY`.
 POSIX workers require `pi` on PATH (or `PI_A2A_PI_BIN`)
 and existing authorized Pi model configuration. `--offline` disables startup
@@ -164,7 +165,7 @@ endpoint. Rotation affects only new sends; uncertain work isn't replayed to
 a replacement chief. Replies return to the initiating Pi. OpenCode remains
 responsible for its own model/auth routing.
 
-### Machine companion v1 (0.2.0 candidate)
+### Machine companion v1 (0.2.0)
 
 From the clone root, with the same `PI_A2A_STATE` as the receiving Pi:
 
@@ -467,7 +468,7 @@ Keep the endpoint restricted, use only trusted recipients, and consider model
 cost and confidentiality. Runtime state contains sensitive messages and paths;
 never commit or publish it, credentials, pointers or real session transcripts.
 
-### Native Windows candidate security and launch policy
+### Native Windows security and launch policy
 
 Initial scope: **local fixed NTFS**, current-user-owned storage, Windows
 PowerShell **5.1**/.NET Framework and Node **22.19.0+**. No WSL, UNC/network,
@@ -557,7 +558,7 @@ checked). `PI_A2A_PI_BIN` is POSIX-only. Node/entry/package metadata must be on
 supported paths with secure ancestors, no reparse points or hardlinks. This
 checks installed metadata; it does not attest package provenance/version.
 
-For the next native proof worker, first discover/verify the installed Pi JS
+For native use, first discover/verify the installed Pi JS
 entry/package and execute the supported native Node, **not an older PATH Node**.
 Using PowerShell, with fictional reviewed paths replaced:
 
@@ -572,11 +573,15 @@ $env:PI_A2A_PROBE_ROOT = 'C:\PrivateLeaf\fresh-disposable-probe'
 For the probe, `PI_A2A_PROBE_ROOT` is mandatory on Windows and must be absent;
 it is protected before any fixture payload, and only that owned disposable leaf
 is removed afterward. The mailbox leaf's parent must also already exist and
-pass checks. The CLI alone is not launch proof: prove actual native worker RPC,
-ACL inheritance for files/temp/lock/transcripts, controlled unsafe/reparse/hardlink
-negatives, sharing/rename/watch/restart behavior and exact saved Pi intake.
-No native acceptance is claimed here; installed-shim/version discovery and
-these runtime checks remain the next lane.
+pass checks. CLI admission alone is not saved-intake or worker-launch proof.
+A bounded native companion check used Pi 1.0.4, Node 22.23.3, a genuine
+AgentSession/SessionManager writer and independent public CLI callers with complete
+stdin EOF. Queue and actual busy-steer wakes returned `consumed` / `saved_exact`
+with matching saved entries. One status call failed incomplete-lock validation;
+a bounded same-key status retry succeeded without another send or facade.
+Lock/security failures remain fail-closed: do not delete locks or replay uncertain
+effects to make a check pass. This is not a throughput, first-try availability,
+live-provider, OS-process-restart or worker-create timing guarantee.
 
 ## Tests and limits
 
@@ -655,7 +660,7 @@ not a passing non-Windows skip or portable mock. Full portable suites may be
 much slower on Windows because each security check launches PowerShell.
 Explicit creation is intended to avoid an elevated token's Administrators default
 owner for Store objects, without changing token defaults or accepting that owner
-for Store. This implementation is still a candidate pending native execution.
+for Store. Native host validation does not waive these ownership requirements.
 An installed Node with ordinary-user write grants
 fails trusted launch verification; do not repair its installation to run a test.
 
@@ -672,8 +677,7 @@ The first includes the original synthetic native reply regression plus a genuine
 installed AgentSession/Agent loop and writer with a local synthetic stream and
 network access explicitly forbidden. On the validated POSIX host, it proves
 external message_end is not consumed before append and three queue/steer wakes
-become consumed after real saved writes. Native Windows saved-wake consumption
-remains unproved. Its caller and receiver share one Runtime:
+become consumed after real saved writes. Its caller and receiver share one Runtime:
 explicit real timer turns and completion of normal reconciliation between
 admissions model an independently scheduled caller, not throughput or native
 availability proof. No manual heartbeat/capability update is used. It is not a
