@@ -194,6 +194,8 @@ malformed UTF-8, BOM, lone surrogates and trailing frames are rejected.
 `expectReply` must be **false**; v1 never subscribes to replies or waits for an
 answer. Only an existing capable `pi/<id>` is allowed, not OpenCode, chief,
 titles or launch. `queue` maps to Pi `followUp`; `steer` maps to `steer`.
+For send/lookup, `to` must match `pi/[A-Za-z0-9][A-Za-z0-9_-]{0,95}`;
+malformed addresses return `SCHEMA`, not an absent-target snapshot.
 External wakes bypass native reply-bearing serialization, including while busy.
 
 One newline-terminated JSON object (at most 8192 bytes) is written to stdout;
@@ -270,7 +272,8 @@ Docket uses only this public companion, never the mailbox or source internals.
 Current `state` is `admitted`, `injected`, `consumed`, `cancelled`, `uncertain`, or
 `failed`. (`pending` is reserved; not currently emitted.) Facts are monotonic:
 admitted means committed ledger admission; claimed means irreversible exclusive
-injection intent; injected means facade return or stronger saved evidence;
+injection intent; injected means successful facade completion (including a
+fulfilled async return), or stronger saved evidence;
 observed means exact message event or stronger saved evidence. **Consumed alone
 means exact saved-session intake**: a complete newline JSONL entry under the
 right session header, distinct `pi-a2a-external-v1` custom type, internal ID,
@@ -279,6 +282,10 @@ persisted before reporting it. Neither message_start/end, in-memory entries,
 facade return, assistant output nor settlement is saved-consumption proof.
 Pi 1.0.4 emits message_end before its writer appends. Hooks return before deferred
 reconciliation reads the file; status may safely advance saved-proof scanning.
+Status is transactional, not pure inspection: it may create the configured root,
+expire a pending request, compact state, and persist proof-scan progress or
+matching receipts for the same target. It does not renew target heartbeats.
+Only capabilities/lookup are the pure inspection operations.
 
 `evidence` is one of `not_checked`, `missing`, `unsafe`, `changed`,
 `partial_header`, `session_mismatch`, `oversized_record`, `invalid_record`,
@@ -377,6 +384,10 @@ reject v2. Native tool/worker/bridge collections remain separate and retain thei
 original semantics; legacy seen/notified flags are never external intake proof.
 
 ### Legacy human companion (deprecated)
+
+These deprecated human commands use argv/plain errors and the native request
+lifecycle; they do not provide machine-v1 schemas, fixed exits, retained caller/id
+receipts, or external no-replay guarantees.
 
 From the clone root, with the same `PI_A2A_STATE` as the receiving Pi:
 
@@ -659,9 +670,10 @@ PI_A2A_PI_BIN=pi npm run probe
 
 The first includes the original synthetic native reply regression plus a genuine
 installed AgentSession/Agent loop and writer with a local synthetic stream and
-network access explicitly forbidden. It proves external message_end is not
-consumed before append and three queue/steer wakes become consumed after real
-saved writes on the validated host. Its caller and receiver share one Runtime:
+network access explicitly forbidden. On the validated POSIX host, it proves
+external message_end is not consumed before append and three queue/steer wakes
+become consumed after real saved writes. Native Windows saved-wake consumption
+remains unproved. Its caller and receiver share one Runtime:
 explicit real timer turns and completion of normal reconciliation between
 admissions model an independently scheduled caller, not throughput or native
 availability proof. No manual heartbeat/capability update is used. It is not a
